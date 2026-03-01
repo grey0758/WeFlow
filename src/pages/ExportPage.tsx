@@ -239,6 +239,8 @@ function ExportPage() {
   const location = useLocation()
 
   const [isLoading, setIsLoading] = useState(true)
+  const [isSessionEnriching, setIsSessionEnriching] = useState(false)
+  const [isSnsStatsLoading, setIsSnsStatsLoading] = useState(true)
   const [sessions, setSessions] = useState<SessionRow[]>([])
   const [sessionMetrics, setSessionMetrics] = useState<Record<string, SessionMetrics>>({})
   const [searchKeyword, setSearchKeyword] = useState('')
@@ -291,6 +293,7 @@ function ExportPage() {
   const runningTaskIdRef = useRef<string | null>(null)
   const tasksRef = useRef<ExportTask[]>([])
   const sessionMetricsRef = useRef<Record<string, SessionMetrics>>({})
+  const sessionLoadTokenRef = useRef(0)
   const loadingMetricsRef = useRef<Set<string>>(new Set())
   const preselectAppliedRef = useRef(false)
 
@@ -363,6 +366,7 @@ function ExportPage() {
   }, [])
 
   const loadSnsStats = useCallback(async () => {
+    setIsSnsStatsLoading(true)
     try {
       const result = await window.electronAPI.sns.getExportStats()
       if (result.success && result.data) {
@@ -373,80 +377,122 @@ function ExportPage() {
       }
     } catch (error) {
       console.error('加载朋友圈导出统计失败:', error)
+    } finally {
+      setIsSnsStatsLoading(false)
     }
   }, [])
 
   const loadSessions = useCallback(async () => {
+    const loadToken = Date.now()
+    sessionLoadTokenRef.current = loadToken
     setIsLoading(true)
+    setIsSessionEnriching(false)
+
+    const isStale = () => sessionLoadTokenRef.current !== loadToken
+
     try {
       const connectResult = await window.electronAPI.chat.connect()
       if (!connectResult.success) {
         console.error('连接失败:', connectResult.error)
-        setIsLoading(false)
+        if (!isStale()) setIsLoading(false)
         return
       }
 
-      const [sessionsResult, contactsResult] = await Promise.all([
-        window.electronAPI.chat.getSessions(),
-        window.electronAPI.chat.getContacts()
-      ])
-
-      const contacts: ContactInfo[] = contactsResult.success && contactsResult.contacts ? contactsResult.contacts : []
-      const nextContactMap = contacts.reduce<Record<string, ContactInfo>>((map, contact) => {
-        map[contact.username] = contact
-        return map
-      }, {})
+      const sessionsResult = await window.electronAPI.chat.getSessions()
+      if (isStale()) return
 
       if (sessionsResult.success && sessionsResult.sessions) {
         const baseSessions = sessionsResult.sessions
           .map((session) => {
-            const contact = nextContactMap[session.username]
-            const kind = toKindByContactType(session, contact)
             return {
               ...session,
-              kind,
-              wechatId: contact?.username || session.username,
-              displayName: session.displayName || contact?.displayName || session.username,
-              avatarUrl: session.avatarUrl || contact?.avatarUrl
+              kind: toKindByContactType(session),
+              wechatId: session.username,
+              displayName: session.displayName || session.username,
+              avatarUrl: session.avatarUrl
             } as SessionRow
           })
+          .sort((a, b) => (b.sortTimestamp || b.lastTimestamp || 0) - (a.sortTimestamp || a.lastTimestamp || 0))
 
-        const needsEnrichment = baseSessions
-          .filter(session => !session.avatarUrl || !session.displayName || session.displayName === session.username)
-          .map(session => session.username)
+        if (isStale()) return
+        setSessions(baseSessions)
+        setIsLoading(false)
 
-        let nextSessions = baseSessions
-        if (needsEnrichment.length > 0) {
+        // 后台补齐联系人字段（昵称、头像、类型），不阻塞首屏会话列表渲染。
+        setIsSessionEnriching(true)
+        void (async () => {
           try {
-            const enrichResult = await window.electronAPI.chat.enrichSessionsContactInfo(needsEnrichment)
-            if (enrichResult.success && enrichResult.contacts) {
-              nextSessions = baseSessions.map((session) => {
-                const extra = enrichResult.contacts?.[session.username]
+            const contactsResult = await window.electronAPI.chat.getContacts()
+            if (isStale()) return
+
+            const contacts: ContactInfo[] = contactsResult.success && contactsResult.contacts ? contactsResult.contacts : []
+            const nextContactMap = contacts.reduce<Record<string, ContactInfo>>((map, contact) => {
+              map[contact.username] = contact
+              return map
+            }, {})
+
+            const needsEnrichment = baseSessions
+              .filter(session => !session.avatarUrl || !session.displayName || session.displayName === session.username)
+              .map(session => session.username)
+
+            let extraContactMap: Record<string, { displayName?: string; avatarUrl?: string }> = {}
+            if (needsEnrichment.length > 0) {
+              const enrichResult = await window.electronAPI.chat.enrichSessionsContactInfo(needsEnrichment)
+              if (enrichResult.success && enrichResult.contacts) {
+                extraContactMap = enrichResult.contacts
+              }
+            }
+
+            if (isStale()) return
+            const nextSessions = baseSessions
+              .map((session) => {
+                const contact = nextContactMap[session.username]
+                const extra = extraContactMap[session.username]
+                const displayName = extra?.displayName || contact?.displayName || session.displayName || session.username
+                const avatarUrl = extra?.avatarUrl || session.avatarUrl || contact?.avatarUrl
                 return {
                   ...session,
-                  displayName: extra?.displayName || session.displayName || session.username,
-                  avatarUrl: extra?.avatarUrl || session.avatarUrl
+                  kind: toKindByContactType(session, contact),
+                  wechatId: contact?.username || session.wechatId || session.username,
+                  displayName,
+                  avatarUrl
                 }
               })
-            }
+              .sort((a, b) => {
+                const aMetric = sessionMetricsRef.current[a.username]?.totalMessages ?? 0
+                const bMetric = sessionMetricsRef.current[b.username]?.totalMessages ?? 0
+                if (bMetric !== aMetric) return bMetric - aMetric
+                return (b.sortTimestamp || b.lastTimestamp || 0) - (a.sortTimestamp || a.lastTimestamp || 0)
+              })
+
+            setSessions(nextSessions)
           } catch (enrichError) {
             console.error('导出页补充会话联系人信息失败:', enrichError)
+          } finally {
+            if (!isStale()) setIsSessionEnriching(false)
           }
-        }
-
-        setSessions(nextSessions)
+        })()
+      } else {
+        setIsLoading(false)
       }
     } catch (error) {
       console.error('加载会话失败:', error)
+      if (!isStale()) setIsLoading(false)
     } finally {
-      setIsLoading(false)
+      if (!isStale()) setIsLoading(false)
     }
   }, [])
 
   useEffect(() => {
-    loadBaseConfig()
-    loadSessions()
-    loadSnsStats()
+    void loadBaseConfig()
+    void loadSessions()
+
+    // 朋友圈统计延后一点加载，避免与首屏会话初始化抢占。
+    const timer = window.setTimeout(() => {
+      void loadSnsStats()
+    }, 180)
+
+    return () => window.clearTimeout(timer)
   }, [loadBaseConfig, loadSessions, loadSnsStats])
 
   useEffect(() => {
@@ -470,12 +516,12 @@ function ExportPage() {
     const keyword = searchKeyword.trim().toLowerCase()
     return sessions
       .filter((session) => {
-      if (session.kind !== activeTab) return false
-      if (!keyword) return true
-      return (
-        (session.displayName || '').toLowerCase().includes(keyword) ||
-        session.username.toLowerCase().includes(keyword)
-      )
+        if (session.kind !== activeTab) return false
+        if (!keyword) return true
+        return (
+          (session.displayName || '').toLowerCase().includes(keyword) ||
+          session.username.toLowerCase().includes(keyword)
+        )
       })
       .sort((a, b) => {
         const totalA = sessionMetrics[a.username]?.totalMessages ?? 0
@@ -1229,6 +1275,7 @@ function ExportPage() {
   const formatCandidateOptions = exportDialog.scope === 'sns'
     ? formatOptions.filter(option => option.value === 'html' || option.value === 'json')
     : formatOptions
+  const showInitialSkeleton = isLoading && sessions.length === 0
 
   return (
     <div className="export-board-page">
@@ -1288,7 +1335,22 @@ function ExportPage() {
       </div>
 
       <div className="content-card-grid">
-        {contentCards.map(card => {
+        {showInitialSkeleton ? Array.from({ length: 6 }).map((_, index) => (
+          <div key={`skeleton-card-${index}`} className="content-card skeleton-card">
+            <div className="skeleton-shimmer skeleton-line w-60"></div>
+            <div className="card-stats">
+              <div className="stat-item">
+                <span className="skeleton-shimmer skeleton-line w-40"></span>
+                <strong className="skeleton-shimmer skeleton-line w-20"></strong>
+              </div>
+              <div className="stat-item">
+                <span className="skeleton-shimmer skeleton-line w-40"></span>
+                <strong className="skeleton-shimmer skeleton-line w-20"></strong>
+              </div>
+            </div>
+            <div className="skeleton-shimmer skeleton-line w-100 h-32"></div>
+          </div>
+        )) : contentCards.map(card => {
           const Icon = card.icon
           return (
             <div key={card.type} className="content-card">
@@ -1299,7 +1361,7 @@ function ExportPage() {
                 {card.stats.map((stat) => (
                   <div key={stat.label} className="stat-item">
                     <span>{stat.label}</span>
-                    <strong>{stat.value.toLocaleString()}</strong>
+                    <strong>{isSnsStatsLoading && card.type === 'sns' ? '--' : stat.value.toLocaleString()}</strong>
                   </div>
                 ))}
               </div>
@@ -1411,14 +1473,32 @@ function ExportPage() {
           </div>
         </div>
 
+        {(isLoading || isSessionEnriching) && (
+          <div className="table-stage-hint">
+            <Loader2 size={14} className="spin" />
+            {isLoading ? '正在加载会话列表…' : '正在补充头像和统计…'}
+          </div>
+        )}
+
         <div className="table-wrap">
           <table className="session-table">
             <thead>{renderTableHeader()}</thead>
             <tbody>
-              {isLoading ? (
+              {showInitialSkeleton ? (
                 <tr>
                   <td colSpan={tableColSpan}>
-                    <div className="table-state"><Loader2 size={16} className="spin" />加载中...</div>
+                    <div className="table-skeleton-list">
+                      {Array.from({ length: 8 }).map((_, rowIndex) => (
+                        <div key={`skeleton-row-${rowIndex}`} className="table-skeleton-item">
+                          <span className="skeleton-shimmer skeleton-dot"></span>
+                          <span className="skeleton-shimmer skeleton-avatar"></span>
+                          <span className="skeleton-shimmer skeleton-line w-30"></span>
+                          <span className="skeleton-shimmer skeleton-line w-12"></span>
+                          <span className="skeleton-shimmer skeleton-line w-12"></span>
+                          <span className="skeleton-shimmer skeleton-line w-12"></span>
+                        </div>
+                      ))}
+                    </div>
                   </td>
                 </tr>
               ) : visibleSessions.length === 0 ? (

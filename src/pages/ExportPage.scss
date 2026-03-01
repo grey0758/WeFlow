@@ -191,6 +191,14 @@
       background: var(--primary-hover);
     }
   }
+
+  &.skeleton-card {
+    pointer-events: none;
+
+    .card-stats {
+      gap: 10px;
+    }
+  }
 }
 
 .task-center {
@@ -330,6 +338,19 @@
   flex-direction: column;
   gap: 10px;
   overflow: hidden;
+}
+
+.table-stage-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(var(--primary-rgb), 0.1);
+  border: 1px solid rgba(var(--primary-rgb), 0.2);
+  color: var(--primary);
+  font-size: 12px;
+  width: fit-content;
 }
 
 .table-toolbar {
@@ -588,6 +609,61 @@
   min-height: 120px;
   color: var(--text-secondary);
 }
+
+.table-skeleton-list {
+  display: grid;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.table-skeleton-item {
+  display: grid;
+  grid-template-columns: 20px 36px minmax(160px, 2fr) repeat(3, minmax(80px, 1fr));
+  align-items: center;
+  gap: 12px;
+  padding: 10px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-secondary) 80%, transparent);
+}
+
+.skeleton-shimmer {
+  position: relative;
+  overflow: hidden;
+  border-radius: 8px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.08) 0%,
+    rgba(255, 255, 255, 0.35) 50%,
+    rgba(255, 255, 255, 0.08) 100%
+  );
+  background-size: 220% 100%;
+  animation: exportSkeletonShimmer 1.2s linear infinite;
+}
+
+.skeleton-dot {
+  width: 16px;
+  height: 16px;
+  border-radius: 6px;
+}
+
+.skeleton-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+}
+
+.skeleton-line {
+  display: inline-block;
+  height: 12px;
+}
+
+.skeleton-line.w-12 { width: 48%; min-width: 42px; }
+.skeleton-line.w-20 { width: 22%; min-width: 36px; }
+.skeleton-line.w-30 { width: 32%; min-width: 120px; }
+.skeleton-line.w-40 { width: 45%; min-width: 80px; }
+.skeleton-line.w-60 { width: 62%; min-width: 110px; }
+.skeleton-line.w-100 { width: 100%; }
+.skeleton-line.h-32 { height: 32px; border-radius: 10px; }
 
 .export-dialog-overlay {
   position: fixed;
@@ -864,6 +940,15 @@
 
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes exportSkeletonShimmer {
+  0% {
+    background-position: 220% 0;
+  }
+  100% {
+    background-position: -20% 0;
   }
 }
 
