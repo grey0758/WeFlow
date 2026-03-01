@@ -74,6 +74,16 @@ export interface ElectronAPI {
   chat: {
     connect: () => Promise<{ success: boolean; error?: string }>
     getSessions: () => Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }>
+    getExportTabCounts: () => Promise<{
+      success: boolean
+      counts?: {
+        private: number
+        group: number
+        official: number
+        former_friend: number
+      }
+      error?: string
+    }>
     enrichSessionsContactInfo: (usernames: string[]) => Promise<{
       success: boolean
       contacts?: Record<string, { displayName?: string; avatarUrl?: string }>

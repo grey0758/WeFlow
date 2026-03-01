@@ -912,6 +912,10 @@ function registerIpcHandlers() {
     return chatService.getSessions()
   })
 
+  ipcMain.handle('chat:getExportTabCounts', async () => {
+    return chatService.getExportTabCounts()
+  })
+
   ipcMain.handle('chat:enrichSessionsContactInfo', async (_, usernames: string[]) => {
     return chatService.enrichSessionsContactInfo(usernames)
   })

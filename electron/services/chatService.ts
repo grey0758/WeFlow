@@ -151,6 +151,13 @@ interface ExportSessionStats {
   groupMutualFriends?: number
 }
 
+interface ExportTabCounts {
+  private: number
+  group: number
+  official: number
+  former_friend: number
+}
+
 // 表情包缓存
 const emojiCache: Map<string, string> = new Map()
 const emojiDownloading: Map<string, Promise<string | null>> = new Map()
@@ -654,6 +661,112 @@ class ChatService {
       }
     } catch (e) {
       console.error('ChatService: 获取联系人信息失败:', e)
+    }
+  }
+
+  /**
+   * 获取导出页会话分类数量（轻量接口，优先用于顶部 Tab 数量展示）
+   */
+  async getExportTabCounts(): Promise<{ success: boolean; counts?: ExportTabCounts; error?: string }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error }
+      }
+
+      const sessionResult = await wcdbService.getSessions()
+      if (!sessionResult.success || !sessionResult.sessions) {
+        return { success: false, error: sessionResult.error || '获取会话失败' }
+      }
+
+      const counts: ExportTabCounts = {
+        private: 0,
+        group: 0,
+        official: 0,
+        former_friend: 0
+      }
+
+      const nonGroupUsernames: string[] = []
+      const usernameSet = new Set<string>()
+
+      for (const row of sessionResult.sessions as Record<string, any>[]) {
+        const username =
+          row.username ||
+          row.user_name ||
+          row.userName ||
+          row.usrName ||
+          row.UsrName ||
+          row.talker ||
+          row.talker_id ||
+          row.talkerId ||
+          ''
+
+        if (!this.shouldKeepSession(username)) continue
+        if (usernameSet.has(username)) continue
+        usernameSet.add(username)
+
+        if (username.endsWith('@chatroom')) {
+          counts.group += 1
+        } else {
+          nonGroupUsernames.push(username)
+        }
+      }
+
+      if (nonGroupUsernames.length === 0) {
+        return { success: true, counts }
+      }
+
+      const contactTypeMap = new Map<string, 'official' | 'former_friend'>()
+      const chunkSize = 400
+
+      for (let i = 0; i < nonGroupUsernames.length; i += chunkSize) {
+        const chunk = nonGroupUsernames.slice(i, i + chunkSize)
+        if (chunk.length === 0) continue
+
+        const usernamesExpr = chunk.map((name) => `'${this.escapeSqlString(name)}'`).join(',')
+        const contactSql = `
+          SELECT username, local_type, quan_pin
+          FROM contact
+          WHERE username IN (${usernamesExpr})
+        `
+
+        const contactResult = await wcdbService.execQuery('contact', null, contactSql)
+        if (!contactResult.success || !contactResult.rows) {
+          continue
+        }
+
+        for (const row of contactResult.rows as Record<string, any>[]) {
+          const username = String(row.username || '').trim()
+          if (!username) continue
+
+          if (username.startsWith('gh_')) {
+            contactTypeMap.set(username, 'official')
+            continue
+          }
+
+          const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], 0)
+          const quanPin = String(this.getRowField(row, ['quan_pin', 'quanPin', 'WCDB_CT_quan_pin']) || '').trim()
+          if (localType === 0 && quanPin) {
+            contactTypeMap.set(username, 'former_friend')
+          }
+        }
+      }
+
+      for (const username of nonGroupUsernames) {
+        const type = contactTypeMap.get(username)
+        if (type === 'official') {
+          counts.official += 1
+        } else if (type === 'former_friend') {
+          counts.former_friend += 1
+        } else {
+          counts.private += 1
+        }
+      }
+
+      return { success: true, counts }
+    } catch (e) {
+      console.error('ChatService: 获取导出页会话分类数量失败:', e)
+      return { success: false, error: String(e) }
     }
   }
 
