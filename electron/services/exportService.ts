@@ -4803,12 +4803,19 @@ class ExportService {
         return { success: false, successCount: 0, failCount: sessionIds.length, error: conn.error }
       }
 
-      if (!fs.existsSync(outputDir)) {
-        fs.mkdirSync(outputDir, { recursive: true })
-      }
-
       const exportMediaEnabled = options.exportMedia === true &&
         Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis)
+      const rawWriteLayout = this.configService.get('exportWriteLayout')
+      const writeLayout = rawWriteLayout === 'A' || rawWriteLayout === 'B' || rawWriteLayout === 'C'
+        ? rawWriteLayout
+        : 'A'
+      const shouldUseTextTypeDir = writeLayout === 'A' && !exportMediaEnabled
+      const exportBaseDir = shouldUseTextTypeDir
+        ? path.join(outputDir, '聊天文本')
+        : outputDir
+      if (!fs.existsSync(exportBaseDir)) {
+        fs.mkdirSync(exportBaseDir, { recursive: true })
+      }
       const sessionLayout = exportMediaEnabled
         ? (options.sessionLayout ?? 'per-session')
         : 'shared'
@@ -4849,7 +4856,7 @@ class ExportService {
         const safeName = suffix ? `${baseName}_${suffix}` : baseName
         const fileNameWithPrefix = `${await this.getSessionFilePrefix(sessionId)}${safeName}`
         const useSessionFolder = sessionLayout === 'per-session'
-        const sessionDir = useSessionFolder ? path.join(outputDir, safeName) : outputDir
+        const sessionDir = useSessionFolder ? path.join(exportBaseDir, safeName) : exportBaseDir
 
         if (useSessionFolder && !fs.existsSync(sessionDir)) {
           fs.mkdirSync(sessionDir, { recursive: true })
