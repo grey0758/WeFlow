@@ -257,6 +257,18 @@ class ChatService {
   }
 
   /**
+   * 判断头像 URL 是否可用，过滤历史缓存里的错误 hex 数据。
+   */
+  private isValidAvatarUrl(avatarUrl?: string): avatarUrl is string {
+    const normalized = String(avatarUrl || '').trim()
+    if (!normalized) return false
+    const normalizedLower = normalized.toLowerCase()
+    if (normalizedLower.includes('base64,ffd8')) return false
+    if (normalizedLower.startsWith('ffd8')) return false
+    return true
+  }
+
+  /**
    * 连接数据库
    */
   async connect(): Promise<{ success: boolean; error?: string }> {
@@ -583,8 +595,7 @@ class ChatService {
         const cached = this.avatarCache.get(username)
         // 如果缓存有效且有头像，直接使用；如果没有头像，也需要重新尝试获取
         // 额外检查：如果头像是无效的 hex 格式（以 ffd8 开头），也需要重新获取
-        const isValidAvatar = cached?.avatarUrl &&
-          !cached.avatarUrl.includes('base64,ffd8') // 检测错误的 hex 格式
+        const isValidAvatar = this.isValidAvatarUrl(cached?.avatarUrl)
         if (cached && now - cached.updatedAt < this.avatarCacheTtlMs && isValidAvatar) {
           result[username] = {
             displayName: cached.displayName,
@@ -3417,7 +3428,7 @@ class ChatService {
       if (!connectResult.success) return null
       const cached = this.avatarCache.get(username)
       // 检查缓存是否有效，且头像不是错误的 hex 格式
-      const isValidAvatar = cached?.avatarUrl && !cached.avatarUrl.includes('base64,ffd8')
+      const isValidAvatar = this.isValidAvatarUrl(cached?.avatarUrl)
       if (cached && isValidAvatar && Date.now() - cached.updatedAt < this.avatarCacheTtlMs) {
         return { avatarUrl: cached.avatarUrl, displayName: cached.displayName }
       }
@@ -3838,7 +3849,9 @@ class ChatService {
       const cachedContact = this.avatarCache.get(normalizedSessionId)
       if (cachedContact) {
         displayName = cachedContact.displayName || normalizedSessionId
-        avatarUrl = cachedContact.avatarUrl
+        if (this.isValidAvatarUrl(cachedContact.avatarUrl)) {
+          avatarUrl = cachedContact.avatarUrl
+        }
       }
 
       const [contactResult, avatarResult] = await Promise.allSettled([
@@ -3854,7 +3867,10 @@ class ChatService {
       }
 
       if (avatarResult.status === 'fulfilled' && avatarResult.value.success && avatarResult.value.map) {
-        avatarUrl = avatarResult.value.map[normalizedSessionId]
+        const avatarCandidate = avatarResult.value.map[normalizedSessionId]
+        if (this.isValidAvatarUrl(avatarCandidate)) {
+          avatarUrl = avatarCandidate
+        }
       }
 
       let messageCount: number | undefined
