@@ -461,6 +461,8 @@ const createTaskId = (): string => `task-${Date.now()}-${Math.random().toString(
 const createExportDiagTraceId = (): string => `export-card-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
 const CONTACT_ENRICH_TIMEOUT_MS = 7000
 const EXPORT_SNS_STATS_CACHE_STALE_MS = 12 * 60 * 60 * 1000
+const EXPORT_SESSION_MESSAGE_COUNT_CACHE_STALE_MS = 12 * 60 * 60 * 1000
+const EXPORT_SESSION_CONTENT_METRIC_CACHE_STALE_MS = 12 * 60 * 60 * 1000
 const EXPORT_AVATAR_ENRICH_BATCH_SIZE = 80
 const CONTACTS_LIST_VIRTUAL_ROW_HEIGHT = 76
 const CONTACTS_LIST_VIRTUAL_OVERSCAN = 10
@@ -635,6 +637,14 @@ const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<
       clearTimeout(timer)
     }
   }
+}
+
+const normalizeTimestampToMs = (value: unknown): number => {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
+  if (value < 1000000000000) {
+    return Math.floor(value * 1000)
+  }
+  return Math.floor(value)
 }
 
 const toContactMapFromCaches = (
@@ -1551,7 +1561,11 @@ function ExportPage() {
   const loadSessionContentStats = useCallback(async (
     sourceSessions: SessionRow[],
     priorityTab: ConversationTab,
-    resolvedMessageCounts?: Record<string, number>
+    resolvedMessageCounts?: Record<string, number>,
+    options?: {
+      scopeKey?: string
+      seededMetrics?: Record<string, SessionContentMetric>
+    }
   ) => {
     const requestId = sessionContentStatsRequestIdRef.current + 1
     sessionContentStatsRequestIdRef.current = requestId
@@ -1603,6 +1617,33 @@ function ExportPage() {
 
     const total = orderedSessionIds.length
     const processedSessionIds = new Set<string>()
+    const mergedMetrics: Record<string, configService.ExportSessionContentMetricCacheEntry> = {}
+    for (const [sessionId, metricRaw] of Object.entries(options?.seededMetrics || {})) {
+      const metric: configService.ExportSessionContentMetricCacheEntry = {}
+      const totalMessages = normalizeMessageCount(metricRaw.totalMessages)
+      const voiceMessages = normalizeMessageCount(metricRaw.voiceMessages)
+      const imageMessages = normalizeMessageCount(metricRaw.imageMessages)
+      const videoMessages = normalizeMessageCount(metricRaw.videoMessages)
+      const emojiMessages = normalizeMessageCount(metricRaw.emojiMessages)
+      if (typeof totalMessages === 'number') metric.totalMessages = totalMessages
+      if (typeof voiceMessages === 'number') metric.voiceMessages = voiceMessages
+      if (typeof imageMessages === 'number') metric.imageMessages = imageMessages
+      if (typeof videoMessages === 'number') metric.videoMessages = videoMessages
+      if (typeof emojiMessages === 'number') metric.emojiMessages = emojiMessages
+      if (Object.keys(metric).length > 0) {
+        mergedMetrics[sessionId] = metric
+      }
+    }
+
+    for (const [sessionId, countRaw] of Object.entries(resolvedMessageCounts || {})) {
+      const count = normalizeMessageCount(countRaw)
+      if (typeof count !== 'number') continue
+      mergedMetrics[sessionId] = {
+        ...(mergedMetrics[sessionId] || {}),
+        totalMessages: count
+      }
+    }
+
     const markChunkProcessed = (chunk: string[]) => {
       for (const sessionId of chunk) {
         processedSessionIds.add(sessionId)
@@ -1624,6 +1665,25 @@ function ExportPage() {
       if (isStale()) return
       if (result?.success && result.data) {
         mergeSessionContentMetrics(result.data as Record<string, SessionExportMetric | undefined>)
+        for (const [sessionId, metricRaw] of Object.entries(result.data as Record<string, SessionExportMetric | undefined>)) {
+          if (!metricRaw) continue
+          const metric: configService.ExportSessionContentMetricCacheEntry = {}
+          const totalMessages = normalizeMessageCount(metricRaw.totalMessages)
+          const voiceMessages = normalizeMessageCount(metricRaw.voiceMessages)
+          const imageMessages = normalizeMessageCount(metricRaw.imageMessages)
+          const videoMessages = normalizeMessageCount(metricRaw.videoMessages)
+          const emojiMessages = normalizeMessageCount(metricRaw.emojiMessages)
+          if (typeof totalMessages === 'number') metric.totalMessages = totalMessages
+          if (typeof voiceMessages === 'number') metric.voiceMessages = voiceMessages
+          if (typeof imageMessages === 'number') metric.imageMessages = imageMessages
+          if (typeof videoMessages === 'number') metric.videoMessages = videoMessages
+          if (typeof emojiMessages === 'number') metric.emojiMessages = emojiMessages
+          if (Object.keys(metric).length === 0) continue
+          mergedMetrics[sessionId] = {
+            ...(mergedMetrics[sessionId] || {}),
+            ...metric
+          }
+        }
       }
       markChunkProcessed(chunk)
     }
@@ -1664,13 +1724,24 @@ function ExportPage() {
       if (!isStale()) {
         setSessionContentStatsProgress({ completed: processedSessionIds.size, total })
         setIsLoadingSessionContentStats(false)
+        if (options?.scopeKey && Object.keys(mergedMetrics).length > 0) {
+          try {
+            await configService.setExportSessionContentMetricCache(options.scopeKey, mergedMetrics)
+          } catch (cacheError) {
+            console.error('写入导出页会话媒体统计缓存失败:', cacheError)
+          }
+        }
       }
     }
   }, [mergeSessionContentMetrics])
 
   const loadSessionMessageCounts = useCallback(async (
     sourceSessions: SessionRow[],
-    priorityTab: ConversationTab
+    priorityTab: ConversationTab,
+    options?: {
+      scopeKey?: string
+      seededCounts?: Record<string, number>
+    }
   ): Promise<Record<string, number>> => {
     const requestId = sessionCountRequestIdRef.current + 1
     sessionCountRequestIdRef.current = requestId
@@ -1684,11 +1755,19 @@ function ExportPage() {
       }
       return acc
     }, {})
-    const accumulatedCounts: Record<string, number> = { ...seededHintCounts }
-    setSessionMessageCounts(seededHintCounts)
-    if (Object.keys(seededHintCounts).length > 0) {
+    const seededPersistentCounts = Object.entries(options?.seededCounts || {}).reduce<Record<string, number>>((acc, [sessionId, countRaw]) => {
+      const nextCount = normalizeMessageCount(countRaw)
+      if (typeof nextCount === 'number') {
+        acc[sessionId] = nextCount
+      }
+      return acc
+    }, {})
+    const seededCounts = { ...seededHintCounts, ...seededPersistentCounts }
+    const accumulatedCounts: Record<string, number> = { ...seededCounts }
+    setSessionMessageCounts(seededCounts)
+    if (Object.keys(seededCounts).length > 0) {
       mergeSessionContentMetrics(
-        Object.entries(seededHintCounts).reduce<Record<string, SessionContentMetric>>((acc, [sessionId, count]) => {
+        Object.entries(seededCounts).reduce<Record<string, SessionContentMetric>>((acc, [sessionId, count]) => {
           acc[sessionId] = { totalMessages: count }
           return acc
         }, {})
@@ -1700,11 +1779,20 @@ function ExportPage() {
       return { ...accumulatedCounts }
     }
 
-    const prioritizedSessionIds = exportableSessions
+    const pendingSessions = exportableSessions.filter((session) => {
+      const nextCount = normalizeMessageCount(accumulatedCounts[session.username])
+      return typeof nextCount !== 'number'
+    })
+    if (pendingSessions.length === 0) {
+      setIsLoadingSessionCounts(false)
+      return { ...accumulatedCounts }
+    }
+
+    const prioritizedSessionIds = pendingSessions
       .filter(session => session.kind === priorityTab)
       .map(session => session.username)
     const prioritizedSet = new Set(prioritizedSessionIds)
-    const remainingSessionIds = exportableSessions
+    const remainingSessionIds = pendingSessions
       .filter(session => !prioritizedSet.has(session.username))
       .map(session => session.username)
 
@@ -1752,6 +1840,13 @@ function ExportPage() {
     } finally {
       if (!isStale()) {
         setIsLoadingSessionCounts(false)
+        if (options?.scopeKey && Object.keys(accumulatedCounts).length > 0) {
+          try {
+            await configService.setExportSessionMessageCountCache(options.scopeKey, accumulatedCounts)
+          } catch (cacheError) {
+            console.error('写入导出页会话总消息缓存失败:', cacheError)
+          }
+        }
       }
     }
     return { ...accumulatedCounts }
@@ -1777,11 +1872,21 @@ function ExportPage() {
       const scopeKey = await ensureExportCacheScope()
       if (isStale()) return
 
+      const [
+        cachedContactsPayload,
+        cachedMessageCountsPayload,
+        cachedContentMetricsPayload
+      ] = await Promise.all([
+        loadContactsCaches(scopeKey),
+        configService.getExportSessionMessageCountCache(scopeKey),
+        configService.getExportSessionContentMetricCache(scopeKey)
+      ])
+      if (isStale()) return
+
       const {
         contactsItem: cachedContactsItem,
         avatarItem: cachedAvatarItem
-      } = await loadContactsCaches(scopeKey)
-      if (isStale()) return
+      } = cachedContactsPayload
 
       const cachedContacts = cachedContactsItem?.contacts || []
       const cachedAvatarEntries = cachedAvatarItem?.avatars || {}
@@ -1808,14 +1913,110 @@ function ExportPage() {
       if (sessionsResult.success && sessionsResult.sessions) {
         const rawSessions = sessionsResult.sessions
         const baseSessions = toSessionRowsWithContacts(rawSessions, cachedContactMap)
+        const exportableSessionIds = baseSessions
+          .filter((session) => session.hasSession)
+          .map((session) => session.username)
+        const exportableSessionIdSet = new Set(exportableSessionIds)
+
+        const cachedMessageCounts = Object.entries(cachedMessageCountsPayload?.counts || {}).reduce<Record<string, number>>((acc, [sessionId, countRaw]) => {
+          if (!exportableSessionIdSet.has(sessionId)) return acc
+          const nextCount = normalizeMessageCount(countRaw)
+          if (typeof nextCount === 'number') {
+            acc[sessionId] = nextCount
+          }
+          return acc
+        }, {})
+
+        const cachedContentMetrics = Object.entries(cachedContentMetricsPayload?.metrics || {}).reduce<Record<string, SessionContentMetric>>((acc, [sessionId, metricRaw]) => {
+          if (!exportableSessionIdSet.has(sessionId)) return acc
+          if (!metricRaw || typeof metricRaw !== 'object') return acc
+          const metric: SessionContentMetric = {}
+          const totalMessages = normalizeMessageCount(metricRaw.totalMessages)
+          const voiceMessages = normalizeMessageCount(metricRaw.voiceMessages)
+          const imageMessages = normalizeMessageCount(metricRaw.imageMessages)
+          const videoMessages = normalizeMessageCount(metricRaw.videoMessages)
+          const emojiMessages = normalizeMessageCount(metricRaw.emojiMessages)
+          if (typeof totalMessages === 'number') metric.totalMessages = totalMessages
+          if (typeof voiceMessages === 'number') metric.voiceMessages = voiceMessages
+          if (typeof imageMessages === 'number') metric.imageMessages = imageMessages
+          if (typeof videoMessages === 'number') metric.videoMessages = videoMessages
+          if (typeof emojiMessages === 'number') metric.emojiMessages = emojiMessages
+          if (Object.keys(metric).length > 0) {
+            acc[sessionId] = metric
+          }
+          return acc
+        }, {})
+
+        const cachedCountAsMetrics = Object.entries(cachedMessageCounts).reduce<Record<string, SessionContentMetric>>((acc, [sessionId, count]) => {
+          if (typeof normalizeMessageCount(cachedContentMetrics[sessionId]?.totalMessages) === 'number') return acc
+          acc[sessionId] = { totalMessages: count }
+          return acc
+        }, {})
+
+        const latestSessionActivityMs = baseSessions.reduce((maxTs, session) => {
+          const activityTs = normalizeTimestampToMs(session.sortTimestamp || session.lastTimestamp || 0)
+          return Math.max(maxTs, activityTs)
+        }, 0)
+        const messageCountCacheUpdatedAt = normalizeTimestampToMs(cachedMessageCountsPayload?.updatedAt || 0)
+        const contentMetricCacheUpdatedAt = normalizeTimestampToMs(cachedContentMetricsPayload?.updatedAt || 0)
+        const isMessageCountCacheFresh = (
+          messageCountCacheUpdatedAt > 0 &&
+          Date.now() - messageCountCacheUpdatedAt <= EXPORT_SESSION_MESSAGE_COUNT_CACHE_STALE_MS &&
+          latestSessionActivityMs <= messageCountCacheUpdatedAt
+        )
+        const isContentMetricCacheFresh = (
+          contentMetricCacheUpdatedAt > 0 &&
+          Date.now() - contentMetricCacheUpdatedAt <= EXPORT_SESSION_CONTENT_METRIC_CACHE_STALE_MS &&
+          latestSessionActivityMs <= contentMetricCacheUpdatedAt
+        )
+        const hasMessageCountCoverage = exportableSessionIds.every((sessionId) => (
+          typeof normalizeMessageCount(cachedMessageCounts[sessionId]) === 'number'
+        ))
+        const hasContentMetricCoverage = exportableSessionIds.every((sessionId) => {
+          const metric = cachedContentMetrics[sessionId]
+          if (!metric) return false
+          return (
+            typeof normalizeMessageCount(metric.imageMessages) === 'number' &&
+            typeof normalizeMessageCount(metric.voiceMessages) === 'number' &&
+            typeof normalizeMessageCount(metric.emojiMessages) === 'number' &&
+            typeof normalizeMessageCount(metric.videoMessages) === 'number'
+          )
+        })
 
         if (isStale()) return
+        if (Object.keys(cachedMessageCounts).length > 0) {
+          setSessionMessageCounts(cachedMessageCounts)
+        }
+        if (Object.keys(cachedContentMetrics).length > 0) {
+          mergeSessionContentMetrics(cachedContentMetrics)
+        }
+        if (Object.keys(cachedCountAsMetrics).length > 0) {
+          mergeSessionContentMetrics(cachedCountAsMetrics)
+        }
         setSessions(baseSessions)
         sessionsHydratedAtRef.current = Date.now()
         void (async () => {
-          const resolvedMessageCounts = await loadSessionMessageCounts(baseSessions, activeTabRef.current)
+          let resolvedMessageCounts = { ...cachedMessageCounts }
+          const shouldRefreshMessageCounts = !isMessageCountCacheFresh || !hasMessageCountCoverage
+          if (shouldRefreshMessageCounts) {
+            resolvedMessageCounts = await loadSessionMessageCounts(baseSessions, activeTabRef.current, {
+              scopeKey,
+              seededCounts: cachedMessageCounts
+            })
+          } else {
+            setIsLoadingSessionCounts(false)
+          }
           if (isStale()) return
-          await loadSessionContentStats(baseSessions, activeTabRef.current, resolvedMessageCounts)
+          const shouldRefreshContentStats = !isContentMetricCacheFresh || !hasContentMetricCoverage
+          if (shouldRefreshContentStats) {
+            await loadSessionContentStats(baseSessions, activeTabRef.current, resolvedMessageCounts, {
+              scopeKey,
+              seededMetrics: cachedContentMetrics
+            })
+          } else {
+            setIsLoadingSessionContentStats(false)
+            setSessionContentStatsProgress({ completed: 0, total: 0 })
+          }
         })()
         setSessionDataSource(cachedContacts.length > 0 ? 'cache' : 'network')
         if (cachedContacts.length === 0) {
@@ -2005,7 +2206,7 @@ function ExportPage() {
     } finally {
       if (!isStale()) setIsLoading(false)
     }
-  }, [ensureExportCacheScope, loadContactsCaches, loadSessionContentStats, loadSessionMessageCounts, syncContactTypeCounts])
+  }, [ensureExportCacheScope, loadContactsCaches, loadSessionContentStats, loadSessionMessageCounts, mergeSessionContentMetrics, syncContactTypeCounts])
 
   useEffect(() => {
     if (!isExportRoute) return

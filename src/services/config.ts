@@ -37,6 +37,7 @@ export const CONFIG_KEYS = {
   EXPORT_LAST_CONTENT_RUN_MAP: 'exportLastContentRunMap',
   EXPORT_LAST_SNS_POST_COUNT: 'exportLastSnsPostCount',
   EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP: 'exportSessionMessageCountCacheMap',
+  EXPORT_SESSION_CONTENT_METRIC_CACHE_MAP: 'exportSessionContentMetricCacheMap',
   EXPORT_SNS_STATS_CACHE_MAP: 'exportSnsStatsCacheMap',
   SNS_PAGE_CACHE_MAP: 'snsPageCacheMap',
   CONTACTS_LOAD_TIMEOUT_MS: 'contactsLoadTimeoutMs',
@@ -460,6 +461,19 @@ export interface ExportSessionMessageCountCacheItem {
   counts: Record<string, number>
 }
 
+export interface ExportSessionContentMetricCacheEntry {
+  totalMessages?: number
+  voiceMessages?: number
+  imageMessages?: number
+  videoMessages?: number
+  emojiMessages?: number
+}
+
+export interface ExportSessionContentMetricCacheItem {
+  updatedAt: number
+  metrics: Record<string, ExportSessionContentMetricCacheEntry>
+}
+
 export interface ExportSnsStatsCacheItem {
   updatedAt: number
   totalPosts: number
@@ -548,6 +562,88 @@ export async function setExportSessionMessageCountCache(scopeKey: string, counts
     counts: normalized
   }
   await config.set(CONFIG_KEYS.EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP, map)
+}
+
+export async function getExportSessionContentMetricCache(scopeKey: string): Promise<ExportSessionContentMetricCacheItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.EXPORT_SESSION_CONTENT_METRIC_CACHE_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const rawUpdatedAt = (rawItem as Record<string, unknown>).updatedAt
+  const rawMetrics = (rawItem as Record<string, unknown>).metrics
+  if (!rawMetrics || typeof rawMetrics !== 'object') return null
+
+  const metrics: Record<string, ExportSessionContentMetricCacheEntry> = {}
+  for (const [sessionId, rawMetric] of Object.entries(rawMetrics as Record<string, unknown>)) {
+    if (!rawMetric || typeof rawMetric !== 'object') continue
+    const source = rawMetric as Record<string, unknown>
+    const metric: ExportSessionContentMetricCacheEntry = {}
+    if (typeof source.totalMessages === 'number' && Number.isFinite(source.totalMessages) && source.totalMessages >= 0) {
+      metric.totalMessages = Math.floor(source.totalMessages)
+    }
+    if (typeof source.voiceMessages === 'number' && Number.isFinite(source.voiceMessages) && source.voiceMessages >= 0) {
+      metric.voiceMessages = Math.floor(source.voiceMessages)
+    }
+    if (typeof source.imageMessages === 'number' && Number.isFinite(source.imageMessages) && source.imageMessages >= 0) {
+      metric.imageMessages = Math.floor(source.imageMessages)
+    }
+    if (typeof source.videoMessages === 'number' && Number.isFinite(source.videoMessages) && source.videoMessages >= 0) {
+      metric.videoMessages = Math.floor(source.videoMessages)
+    }
+    if (typeof source.emojiMessages === 'number' && Number.isFinite(source.emojiMessages) && source.emojiMessages >= 0) {
+      metric.emojiMessages = Math.floor(source.emojiMessages)
+    }
+    if (Object.keys(metric).length === 0) continue
+    metrics[sessionId] = metric
+  }
+
+  return {
+    updatedAt: typeof rawUpdatedAt === 'number' && Number.isFinite(rawUpdatedAt) ? rawUpdatedAt : 0,
+    metrics
+  }
+}
+
+export async function setExportSessionContentMetricCache(
+  scopeKey: string,
+  metrics: Record<string, ExportSessionContentMetricCacheEntry>
+): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_SESSION_CONTENT_METRIC_CACHE_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+
+  const normalized: Record<string, ExportSessionContentMetricCacheEntry> = {}
+  for (const [sessionId, rawMetric] of Object.entries(metrics || {})) {
+    if (!rawMetric || typeof rawMetric !== 'object') continue
+    const metric: ExportSessionContentMetricCacheEntry = {}
+    if (typeof rawMetric.totalMessages === 'number' && Number.isFinite(rawMetric.totalMessages) && rawMetric.totalMessages >= 0) {
+      metric.totalMessages = Math.floor(rawMetric.totalMessages)
+    }
+    if (typeof rawMetric.voiceMessages === 'number' && Number.isFinite(rawMetric.voiceMessages) && rawMetric.voiceMessages >= 0) {
+      metric.voiceMessages = Math.floor(rawMetric.voiceMessages)
+    }
+    if (typeof rawMetric.imageMessages === 'number' && Number.isFinite(rawMetric.imageMessages) && rawMetric.imageMessages >= 0) {
+      metric.imageMessages = Math.floor(rawMetric.imageMessages)
+    }
+    if (typeof rawMetric.videoMessages === 'number' && Number.isFinite(rawMetric.videoMessages) && rawMetric.videoMessages >= 0) {
+      metric.videoMessages = Math.floor(rawMetric.videoMessages)
+    }
+    if (typeof rawMetric.emojiMessages === 'number' && Number.isFinite(rawMetric.emojiMessages) && rawMetric.emojiMessages >= 0) {
+      metric.emojiMessages = Math.floor(rawMetric.emojiMessages)
+    }
+    if (Object.keys(metric).length === 0) continue
+    normalized[sessionId] = metric
+  }
+
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    metrics: normalized
+  }
+  await config.set(CONFIG_KEYS.EXPORT_SESSION_CONTENT_METRIC_CACHE_MAP, map)
 }
 
 export async function getExportSnsStatsCache(scopeKey: string): Promise<ExportSnsStatsCacheItem | null> {
