@@ -1347,8 +1347,10 @@
     width: var(--contacts-message-col-width);
     min-width: var(--contacts-message-col-width);
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
+    gap: 4px;
     flex-shrink: 0;
     text-align: center;
   }
@@ -1396,6 +1398,30 @@
 
   .row-message-stat.total .row-message-count-value {
     font-size: 13px;
+  }
+
+  .row-open-chat-link {
+    border: none;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    color: var(--primary);
+    font-size: 12px;
+    line-height: 1.2;
+    font-weight: 600;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--primary-hover);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+
+    &:focus-visible {
+      outline: 2px solid color-mix(in srgb, var(--primary) 30%, transparent);
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
   }
 }
 
@@ -1544,33 +1570,6 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-  }
-
-  .row-open-chat-btn {
-    border: 1px solid color-mix(in srgb, var(--primary) 38%, var(--border-color));
-    border-radius: 8px;
-    padding: 7px 10px;
-    background: color-mix(in srgb, var(--primary) 12%, var(--bg-secondary));
-    color: var(--primary);
-    font-size: 12px;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    white-space: nowrap;
-
-    &:hover:not(:disabled) {
-      background: color-mix(in srgb, var(--primary) 18%, var(--bg-secondary));
-      border-color: color-mix(in srgb, var(--primary) 55%, var(--border-color));
-    }
-
-    &:disabled {
-      opacity: 0.65;
-      cursor: not-allowed;
-      color: var(--text-tertiary);
-      border-color: var(--border-color);
-      background: var(--bg-secondary);
-    }
   }
 
   .row-detail-btn {
@@ -2702,6 +2701,10 @@
 
   .table-wrap .row-message-stat.total .row-message-count-value {
     font-size: 12px;
+  }
+
+  .table-wrap .row-open-chat-link {
+    font-size: 11px;
   }
 
   .export-dialog-overlay {

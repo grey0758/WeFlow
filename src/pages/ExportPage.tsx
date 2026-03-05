@@ -3825,6 +3825,11 @@ function ExportPage() {
       : typeof displayedMessageCount === 'number'
         ? displayedMessageCount.toLocaleString('zh-CN')
         : '获取中'
+    const openChatLabel = contact.type === 'friend'
+      ? '打开私聊'
+      : contact.type === 'group'
+        ? '打开群聊'
+        : '打开对话'
     return (
       <div className={`contact-row ${checked ? 'selected' : ''}`}>
         <div className="contact-item">
@@ -3856,21 +3861,21 @@ function ExportPage() {
                 {messageCountLabel}
               </strong>
             </div>
-          </div>
-          <div className="row-action-cell">
-            <div className="row-action-main">
+            {canExport && (
               <button
-                className="row-open-chat-btn"
-                disabled={!canExport}
-                title={canExport ? '在新窗口打开该会话' : '该联系人暂无会话记录'}
+                type="button"
+                className="row-open-chat-link"
+                title="在新窗口打开该会话"
                 onClick={() => {
-                  if (!canExport) return
                   void window.electronAPI.window.openSessionChatWindow(contact.username, { source: 'export' })
                 }}
               >
-                <ExternalLink size={13} />
-                打开对话
+                {openChatLabel}
               </button>
+            )}
+          </div>
+          <div className="row-action-cell">
+            <div className="row-action-main">
               <button
                 className={`row-detail-btn ${showSessionDetailPanel && sessionDetail?.wxid === contact.username ? 'active' : ''}`}
                 onClick={() => openSessionDetail(contact.username)}
