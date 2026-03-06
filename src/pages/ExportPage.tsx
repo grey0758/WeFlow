@@ -1286,6 +1286,7 @@ function ExportPage() {
   const [isExportDefaultsModalOpen, setIsExportDefaultsModalOpen] = useState(false)
   const [timeRangeSelection, setTimeRangeSelection] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
   const [exportDefaultFormat, setExportDefaultFormat] = useState<TextExportFormat>('excel')
+  const [exportDefaultAvatars, setExportDefaultAvatars] = useState(true)
   const [exportDefaultDateRangeSelection, setExportDefaultDateRangeSelection] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
   const [exportDefaultMedia, setExportDefaultMedia] = useState(false)
   const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
@@ -1792,9 +1793,10 @@ function ExportPage() {
     setIsBaseConfigLoading(true)
     let isReady = true
     try {
-      const [savedPath, savedFormat, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, exportCacheScope] = await Promise.all([
+      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, exportCacheScope] = await Promise.all([
         configService.getExportPath(),
         configService.getExportDefaultFormat(),
+        configService.getExportDefaultAvatars(),
         configService.getExportDefaultMedia(),
         configService.getExportDefaultVoiceAsText(),
         configService.getExportDefaultExcelCompactColumns(),
@@ -1826,6 +1828,7 @@ function ExportPage() {
       setExportRecordsBySession(savedSessionRecordMap)
       setLastSnsExportPostCount(savedSnsPostCount)
       setExportDefaultFormat((savedFormat as TextExportFormat) || 'excel')
+      setExportDefaultAvatars(savedAvatars ?? true)
       setExportDefaultMedia(savedMedia ?? false)
       setExportDefaultVoiceAsText(savedVoiceAsText ?? false)
       setExportDefaultExcelCompactColumns(savedExcelCompactColumns ?? true)
@@ -1848,6 +1851,7 @@ function ExportPage() {
       setOptions(prev => ({
         ...prev,
         format: ((savedFormat as TextExportFormat) || 'excel'),
+        exportAvatars: savedAvatars ?? true,
         exportMedia: savedMedia ?? prev.exportMedia,
         exportVoiceAsText: savedVoiceAsText ?? prev.exportVoiceAsText,
         excelCompactColumns: savedExcelCompactColumns ?? prev.excelCompactColumns,
@@ -3205,6 +3209,7 @@ function ExportPage() {
       const next: ExportOptions = {
         ...prev,
         format: exportDefaultFormat,
+        exportAvatars: exportDefaultAvatars,
         useAllTime: exportDefaultDateRangeSelection.useAllTime,
         dateRange: nextDateRange,
         exportMedia: exportDefaultMedia,
@@ -3224,7 +3229,6 @@ function ExportPage() {
           next.exportVoices = false
           next.exportVideos = false
           next.exportEmojis = false
-          next.exportAvatars = true
         } else {
           next.exportMedia = true
           next.exportImages = payload.contentType === 'image'
@@ -3241,6 +3245,7 @@ function ExportPage() {
     exportDefaultDateRangeSelection,
     exportDefaultExcelCompactColumns,
     exportDefaultFormat,
+    exportDefaultAvatars,
     exportDefaultMedia,
     exportDefaultVoiceAsText,
     exportDefaultConcurrency
@@ -3351,7 +3356,7 @@ function ExportPage() {
           format: fastTextFormat,
           contentType,
           exportConcurrency: textExportConcurrency,
-          exportAvatars: true,
+          exportAvatars: base.exportAvatars,
           exportMedia: false,
           exportImages: false,
           exportVoices: false,
@@ -3764,6 +3769,7 @@ function ExportPage() {
     closeExportDialog()
 
     await configService.setExportDefaultFormat(options.format)
+    await configService.setExportDefaultAvatars(options.exportAvatars)
     await configService.setExportDefaultMedia(Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis))
     await configService.setExportDefaultVoiceAsText(options.exportVoiceAsText)
     await configService.setExportDefaultExcelCompactColumns(options.excelCompactColumns)
@@ -4892,6 +4898,10 @@ function ExportPage() {
   const isContentTextDialog = isContentScopeDialog && exportDialog.contentType === 'text'
   const shouldShowFormatSection = !isContentScopeDialog || isContentTextDialog
   const shouldShowMediaSection = !isContentScopeDialog
+  const avatarExportStatusLabel = options.exportAvatars ? '已开启聊天消息导出带头像' : '已关闭聊天消息导出带头像'
+  const textContentFormatNote = options.exportAvatars
+    ? '此模式包含用户头像，不导出图片语音视频表情包等多媒体内容'
+    : '此模式不包含用户头像，不导出图片语音视频表情包等多媒体内容'
   const shouldShowDisplayNameSection = !(
     exportDialog.scope === 'sns' ||
     (
@@ -5174,6 +5184,10 @@ function ExportPage() {
   const handleExportDefaultsChanged = useCallback((patch: ExportDefaultsSettingsPatch) => {
     if (patch.format) {
       setExportDefaultFormat(patch.format as TextExportFormat)
+    }
+    if (typeof patch.avatars === 'boolean') {
+      setExportDefaultAvatars(patch.avatars)
+      setOptions(prev => ({ ...prev, exportAvatars: patch.avatars! }))
     }
     if (patch.dateRange) {
       setExportDefaultDateRangeSelection(patch.dateRange)
@@ -6044,8 +6058,11 @@ function ExportPage() {
               {shouldShowFormatSection && (
                 <div className="dialog-section">
                   <h4>{exportDialog.scope === 'sns' ? '朋友圈导出格式选择' : '对话文本导出格式选择'}</h4>
+                  {!isContentScopeDialog && exportDialog.scope !== 'sns' && (
+                    <div className="format-note">{avatarExportStatusLabel}</div>
+                  )}
                   {isContentTextDialog && (
-                    <div className="format-note">说明：此模式默认导出头像，不导出图片、语音、视频、表情包等媒体内容。</div>
+                    <div className="format-note">{textContentFormatNote}</div>
                   )}
                   <div className="format-grid">
                     {formatCandidateOptions.map(option => (
@@ -6086,7 +6103,7 @@ function ExportPage() {
 
               {shouldShowMediaSection && (
                 <div className="dialog-section">
-                  <h4>{exportDialog.scope === 'sns' ? '媒体文件（可多选）' : '媒体与头像'}</h4>
+                  <h4>{exportDialog.scope === 'sns' ? '媒体文件（可多选）' : '媒体内容'}</h4>
                   <div className="media-check-grid">
                     {exportDialog.scope === 'sns' ? (
                       <>
@@ -6101,7 +6118,6 @@ function ExportPage() {
                         <label><input type="checkbox" checked={options.exportVideos} onChange={event => setOptions(prev => ({ ...prev, exportVideos: event.target.checked }))} /> 视频</label>
                         <label><input type="checkbox" checked={options.exportEmojis} onChange={event => setOptions(prev => ({ ...prev, exportEmojis: event.target.checked }))} /> 表情包</label>
                         <label><input type="checkbox" checked={options.exportVoiceAsText} onChange={event => setOptions(prev => ({ ...prev, exportVoiceAsText: event.target.checked }))} /> 语音转文字</label>
-                        <label><input type="checkbox" checked={options.exportAvatars} onChange={event => setOptions(prev => ({ ...prev, exportAvatars: event.target.checked }))} /> 导出头像</label>
                       </>
                     )}
                   </div>

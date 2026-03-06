@@ -13,6 +13,7 @@ import './ExportDefaultsSettingsForm.scss'
 
 export interface ExportDefaultsSettingsPatch {
   format?: string
+  avatars?: boolean
   dateRange?: ExportDateRangeSelection
   media?: boolean
   voiceAsText?: boolean
@@ -59,6 +60,7 @@ export function ExportDefaultsSettingsForm({
   const exportExcelColumnsDropdownRef = useRef<HTMLDivElement>(null)
 
   const [exportDefaultFormat, setExportDefaultFormat] = useState('excel')
+  const [exportDefaultAvatars, setExportDefaultAvatars] = useState(true)
   const [exportDefaultDateRange, setExportDefaultDateRange] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
   const [exportDefaultMedia, setExportDefaultMedia] = useState(false)
   const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
@@ -68,8 +70,9 @@ export function ExportDefaultsSettingsForm({
   useEffect(() => {
     let cancelled = false
     void (async () => {
-      const [savedFormat, savedDateRange, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedConcurrency] = await Promise.all([
+      const [savedFormat, savedAvatars, savedDateRange, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedConcurrency] = await Promise.all([
         configService.getExportDefaultFormat(),
+        configService.getExportDefaultAvatars(),
         configService.getExportDefaultDateRange(),
         configService.getExportDefaultMedia(),
         configService.getExportDefaultVoiceAsText(),
@@ -80,6 +83,7 @@ export function ExportDefaultsSettingsForm({
       if (cancelled) return
 
       setExportDefaultFormat(savedFormat || 'excel')
+      setExportDefaultAvatars(savedAvatars ?? true)
       setExportDefaultDateRange(resolveExportDateRangeConfig(savedDateRange))
       setExportDefaultMedia(savedMedia ?? false)
       setExportDefaultVoiceAsText(savedVoiceAsText ?? false)
@@ -164,6 +168,34 @@ export function ExportDefaultsSettingsForm({
                 <span className="format-desc">{option.desc}</span>
               </button>
             ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="form-group">
+        <div className="form-copy">
+          <label>聊天消息导出带头像</label>
+          <span className="form-hint">开启后导出的聊天消息对应的文件中会带头像信息。</span>
+        </div>
+        <div className="form-control">
+          <div className="log-toggle-line">
+            <span className="log-status">{exportDefaultAvatars ? '已开启' : '已关闭'}</span>
+            <label className="switch" htmlFor="shared-export-default-avatars">
+              <input
+                id="shared-export-default-avatars"
+                className="switch-input"
+                type="checkbox"
+                checked={exportDefaultAvatars}
+                onChange={async (e) => {
+                  const enabled = e.target.checked
+                  setExportDefaultAvatars(enabled)
+                  await configService.setExportDefaultAvatars(enabled)
+                  onDefaultsChanged?.({ avatars: enabled })
+                  notify(enabled ? '已开启聊天消息导出带头像' : '已关闭聊天消息导出带头像', true)
+                }}
+              />
+              <span className="switch-slider" />
+            </label>
           </div>
         </div>
       </div>

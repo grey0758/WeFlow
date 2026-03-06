@@ -27,6 +27,7 @@ export const CONFIG_KEYS = {
   AUTO_TRANSCRIBE_VOICE: 'autoTranscribeVoice',
   TRANSCRIBE_LANGUAGES: 'transcribeLanguages',
   EXPORT_DEFAULT_FORMAT: 'exportDefaultFormat',
+  EXPORT_DEFAULT_AVATARS: 'exportDefaultAvatars',
   EXPORT_DEFAULT_DATE_RANGE: 'exportDefaultDateRange',
   EXPORT_DEFAULT_MEDIA: 'exportDefaultMedia',
   EXPORT_DEFAULT_VOICE_AS_TEXT: 'exportDefaultVoiceAsText',
@@ -333,6 +334,18 @@ export async function getExportDefaultFormat(): Promise<string | null> {
 // 设置导出默认格式
 export async function setExportDefaultFormat(format: string): Promise<void> {
   await config.set(CONFIG_KEYS.EXPORT_DEFAULT_FORMAT, format)
+}
+
+// 获取导出默认头像设置
+export async function getExportDefaultAvatars(): Promise<boolean | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_AVATARS)
+  if (typeof value === 'boolean') return value
+  return null
+}
+
+// 设置导出默认头像设置
+export async function setExportDefaultAvatars(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_AVATARS, enabled)
 }
 
 // 获取导出默认时间范围
