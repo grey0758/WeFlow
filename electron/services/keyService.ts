@@ -810,7 +810,16 @@ export class KeyService {
     try {
       // 1. 查找模板文件获取密文和 XOR 密钥
       onProgress?.('正在查找模板文件...')
-      const { ciphertext, xorKey } = await this._findTemplateData(userDir)
+      let result = await this._findTemplateData(userDir, 32)
+      let { ciphertext, xorKey } = result
+      
+      // 如果找不到密钥，尝试扫描更多文件
+      if (ciphertext && xorKey === null) {
+        onProgress?.('未找到有效密钥，尝试扫描更多文件...')
+        result = await this._findTemplateData(userDir, 100)
+        xorKey = result.xorKey
+      }
+      
       if (!ciphertext) return { success: false, error: '未找到 V2 模板文件，请先在微信中查看几张图片' }
       if (xorKey === null) return { success: false, error: '未能从模板文件中计算出有效的 XOR 密钥，请确保在微信中查看了多张不同的图片' }
 
@@ -846,26 +855,26 @@ export class KeyService {
     }
   }
 
-  private async _findTemplateData(userDir: string): Promise<{ ciphertext: Buffer | null; xorKey: number | null }> {
+  private async _findTemplateData(userDir: string, limit: number = 32): Promise<{ ciphertext: Buffer | null; xorKey: number | null }> {
     const { readdirSync, readFileSync, statSync } = await import('fs')
     const { join } = await import('path')
     const V2_MAGIC = Buffer.from([0x07, 0x08, 0x56, 0x32, 0x08, 0x07])
 
     // 递归收集 *_t.dat 文件
-    const collect = (dir: string, results: string[], limit = 32) => {
-      if (results.length >= limit) return
+    const collect = (dir: string, results: string[], maxFiles: number) => {
+      if (results.length >= maxFiles) return
       try {
         for (const entry of readdirSync(dir, { withFileTypes: true })) {
-          if (results.length >= limit) break
+          if (results.length >= maxFiles) break
           const full = join(dir, entry.name)
-          if (entry.isDirectory()) collect(full, results, limit)
+          if (entry.isDirectory()) collect(full, results, maxFiles)
           else if (entry.isFile() && entry.name.endsWith('_t.dat')) results.push(full)
         }
       } catch { /* 忽略无权限目录 */ }
     }
 
     const files: string[] = []
-    collect(userDir, files)
+    collect(userDir, files, limit)
 
     // 按修改时间降序
     files.sort((a, b) => {
