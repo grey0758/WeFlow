@@ -2061,7 +2061,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 <RefreshCw size={16} className={isCheckingUpdate ? 'spin' : ''} />
                 {isCheckingUpdate ? '检查中...' : '检查更新'}
               </button>
-
             </div>
           )}
         </div>

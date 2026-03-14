@@ -89,7 +89,6 @@ const UpdateDialog: React.FC<UpdateDialogProps> = ({
                             <Quote size={20} />
                         </div>
                         <div className="text-box">
-                            <h3>优化</h3>
                             {updateInfo.releaseNotes ? (
                                 <div dangerouslySetInnerHTML={{ __html: updateInfo.releaseNotes }} />
                             ) : (
