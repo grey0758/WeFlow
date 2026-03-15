@@ -116,11 +116,30 @@ export class KeyServiceMac {
     }
   }
 
+  private async checkSipStatus(): Promise<{ enabled: boolean; error?: string }> {
+    try {
+      const { stdout } = await execFileAsync('/usr/bin/csrutil', ['status'])
+      const enabled = stdout.toLowerCase().includes('enabled')
+      return { enabled }
+    } catch (e: any) {
+      return { enabled: false, error: e.message }
+    }
+  }
+
   async autoGetDbKey(
     timeoutMs = 60_000,
     onStatus?: (message: string, level: number) => void
   ): Promise<DbKeyResult> {
     try {
+      // 检测 SIP 状态
+      const sipStatus = await this.checkSipStatus()
+      if (sipStatus.enabled) {
+        return {
+          success: false,
+          error: 'SIP (系统完整性保护) 已开启，无法获取密钥。请关闭 SIP 后重试。\n\n关闭方法：\n1. 重启 Mac 并按住 Command + R 进入恢复模式\n2. 打开终端，输入: csrutil disable\n3. 重启电脑'
+        }
+      }
+
       onStatus?.('正在获取数据库密钥...', 0)
       onStatus?.('正在请求管理员授权并执行 helper...', 0)
       let parsed: { success: boolean; key?: string; code?: string; detail?: string; raw: string }
@@ -764,7 +783,7 @@ export class KeyServiceMac {
           }
 
           const current = chunk.subarray(0, bytesRead)
-          const data = trailing ? Buffer.concat([trailing, current]) : current
+          const data: Buffer = trailing ? Buffer.concat([trailing, current]) : current
           const key = this._searchAsciiKey(data, ciphertext) || this._searchUtf16Key(data, ciphertext)
           if (key) return key
           // 兜底：兼容旧 C++ 的滑窗 16-byte 扫描（严格规则 miss 时仍可命中）
@@ -793,8 +812,8 @@ export class KeyServiceMac {
       }
       const tag = elevated ? '[image_scan_helper:elevated]' : '[image_scan_helper]'
       let stdout = '', stderr = ''
-      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
-      child.stderr.on('data', (chunk: Buffer) => {
+      child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
+      child.stderr?.on('data', (chunk: Buffer) => {
         stderr += chunk.toString()
         console.log(tag, chunk.toString().trim())
       })
