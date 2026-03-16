@@ -116,6 +116,40 @@ function resolveSearchSenderUsernameFallback(value?: string | null): string | un
   return normalized
 }
 
+function buildSearchIdentityCandidates(value?: string | null): string[] {
+  const normalized = normalizeSearchIdentityText(value)
+  if (!normalized) return []
+  const lower = normalized.toLowerCase()
+  const candidates = new Set<string>([lower])
+  if (lower.startsWith('wxid_')) {
+    const match = lower.match(/^(wxid_[^_]+)/i)
+    if (match?.[1]) {
+      candidates.add(match[1])
+    }
+  }
+  return [...candidates]
+}
+
+function isCurrentUserSearchIdentity(
+  senderUsername?: string | null,
+  myWxid?: string | null
+): boolean {
+  const senderCandidates = buildSearchIdentityCandidates(senderUsername)
+  const selfCandidates = buildSearchIdentityCandidates(myWxid)
+  if (senderCandidates.length === 0 || selfCandidates.length === 0) {
+    return false
+  }
+
+  for (const sender of senderCandidates) {
+    for (const self of selfCandidates) {
+      if (sender === self) return true
+      if (sender.startsWith(self + '_')) return true
+      if (self.startsWith(sender + '_')) return true
+    }
+  }
+  return false
+}
+
 interface XmlField {
   key: string;
   value: string;
@@ -2764,6 +2798,7 @@ function ChatPage(props: ChatPageProps) {
     const {
       normalizedSessionId,
       isDirectSearchSession,
+      isGroupSearchSession,
       resolvedSessionDisplayName,
       resolvedSessionAvatarUrl
     } = resolveSearchSessionContext(sessionId)
@@ -2771,6 +2806,7 @@ function ChatPage(props: ChatPageProps) {
 
     return sortedMessages.map((message) => {
       const senderUsername = normalizeSearchIdentityText(message.senderUsername) || message.senderUsername
+      const inferredSelfFromSender = isGroupSearchSession && isCurrentUserSearchIdentity(senderUsername, myWxid)
       const senderDisplayName = resolveSearchSenderDisplayName(
         message.senderDisplayName,
         senderUsername,
@@ -2778,7 +2814,8 @@ function ChatPage(props: ChatPageProps) {
       )
       const senderUsernameFallback = resolveSearchSenderUsernameFallback(senderUsername)
       const senderAvatarUrl = normalizeSearchAvatarUrl(message.senderAvatarUrl)
-      const nextSenderDisplayName = message.isSend === 1
+      const nextIsSend = inferredSelfFromSender ? 1 : message.isSend
+      const nextSenderDisplayName = nextIsSend === 1
         ? (senderDisplayName || '我')
         : (
             senderDisplayName ||
@@ -2787,12 +2824,29 @@ function ChatPage(props: ChatPageProps) {
             (isDirectSearchSession ? resolvedSessionUsernameFallback : undefined) ||
             '未知'
           )
-      const nextSenderAvatarUrl = message.isSend === 1
+      const nextSenderAvatarUrl = nextIsSend === 1
         ? (senderAvatarUrl || myAvatarUrl)
         : (senderAvatarUrl || (isDirectSearchSession ? resolvedSessionAvatarUrl : undefined))
 
+      if (inferredSelfFromSender) {
+        console.info('[InSessionSearch][GroupSelfHit][hydrate]', {
+          sessionId: normalizedSessionId,
+          localId: message.localId,
+          senderUsername,
+          rawIsSend: message.isSend,
+          nextIsSend,
+          rawSenderDisplayName: message.senderDisplayName,
+          nextSenderDisplayName,
+          rawSenderAvatarUrl: message.senderAvatarUrl,
+          nextSenderAvatarUrl,
+          myWxid,
+          hasMyAvatarUrl: Boolean(myAvatarUrl)
+        })
+      }
+
       if (
         senderUsername === message.senderUsername &&
+        nextIsSend === message.isSend &&
         nextSenderDisplayName === message.senderDisplayName &&
         nextSenderAvatarUrl === message.senderAvatarUrl
       ) {
@@ -2801,12 +2855,13 @@ function ChatPage(props: ChatPageProps) {
 
       return {
         ...message,
+        isSend: nextIsSend,
         senderUsername,
         senderDisplayName: nextSenderDisplayName,
         senderAvatarUrl: nextSenderAvatarUrl
       }
     })
-  }, [currentSessionId, myAvatarUrl, resolveSearchSessionContext])
+  }, [currentSessionId, myAvatarUrl, myWxid, resolveSearchSessionContext])
 
   const enrichMessagesWithSenderProfiles = useCallback(async (rawMessages: Message[], sessionId?: string) => {
     let messages = hydrateInSessionSearchResults(rawMessages, sessionId)
@@ -2962,6 +3017,7 @@ function ChatPage(props: ChatPageProps) {
     return messages.map((message) => {
       const sender = normalizeSearchIdentityText(message.senderUsername)
       const profile = sender ? profileMap.get(sender) : undefined
+      const inferredSelfFromSender = isGroupSearchSession && isCurrentUserSearchIdentity(sender, myWxid)
       const profileDisplayName = resolveSearchSenderDisplayName(
         profile?.displayName,
         sender,
@@ -2975,7 +3031,8 @@ function ChatPage(props: ChatPageProps) {
       const senderUsernameFallback = resolveSearchSenderUsernameFallback(sender)
       const sessionUsernameFallback = resolveSearchSenderUsernameFallback(normalizedSessionId)
       const currentSenderAvatarUrl = normalizeSearchAvatarUrl(message.senderAvatarUrl)
-      const nextSenderDisplayName = message.isSend === 1
+      const nextIsSend = inferredSelfFromSender ? 1 : message.isSend
+      const nextSenderDisplayName = nextIsSend === 1
         ? (currentSenderDisplayName || profileDisplayName || '我')
         : (
             profileDisplayName ||
@@ -2985,7 +3042,7 @@ function ChatPage(props: ChatPageProps) {
             (isDirectSearchSession ? sessionUsernameFallback : undefined) ||
             '未知'
           )
-      const nextSenderAvatarUrl = message.isSend === 1
+      const nextSenderAvatarUrl = nextIsSend === 1
         ? (currentSenderAvatarUrl || myAvatarUrl || normalizeSearchAvatarUrl(profile?.avatarUrl))
         : (
             currentSenderAvatarUrl ||
@@ -2993,8 +3050,27 @@ function ChatPage(props: ChatPageProps) {
             (isDirectSearchSession ? resolvedSessionAvatarUrl : undefined)
           )
 
+      if (inferredSelfFromSender) {
+        console.info('[InSessionSearch][GroupSelfHit][enrich]', {
+          sessionId: normalizedSessionId,
+          localId: message.localId,
+          senderUsername: sender,
+          rawIsSend: message.isSend,
+          nextIsSend,
+          profileDisplayName,
+          currentSenderDisplayName,
+          nextSenderDisplayName,
+          profileAvatarUrl: normalizeSearchAvatarUrl(profile?.avatarUrl),
+          currentSenderAvatarUrl,
+          nextSenderAvatarUrl,
+          myWxid,
+          hasMyAvatarUrl: Boolean(myAvatarUrl)
+        })
+      }
+
       if (
         sender === message.senderUsername &&
+        nextIsSend === message.isSend &&
         nextSenderDisplayName === message.senderDisplayName &&
         nextSenderAvatarUrl === message.senderAvatarUrl
       ) {
@@ -3003,6 +3079,7 @@ function ChatPage(props: ChatPageProps) {
 
       return {
         ...message,
+        isSend: nextIsSend,
         senderUsername: sender || message.senderUsername,
         senderDisplayName: nextSenderDisplayName,
         senderAvatarUrl: nextSenderAvatarUrl
@@ -3012,6 +3089,7 @@ function ChatPage(props: ChatPageProps) {
     currentSessionId,
     hydrateInSessionSearchResults,
     myAvatarUrl,
+    myWxid,
     resolveSearchSessionContext
   ])
 

@@ -234,6 +234,8 @@ class ChatService {
   // 缓存会话表信息，避免每次查询
   private sessionTablesCache = new Map<string, Array<{ tableName: string; dbPath: string }>>()
   private messageTableColumnsCache = new Map<string, { columns: Set<string>; updatedAt: number }>()
+  private messageName2IdTableCache = new Map<string, string | null>()
+  private messageSenderIdCache = new Map<string, string | null>()
   private readonly sessionTablesCacheTtl = 300000 // 5分钟
   private readonly messageTableColumnsCacheTtlMs = 30 * 60 * 1000
   private sessionMessageCountCache = new Map<string, { count: number; updatedAt: number }>()
@@ -1990,6 +1992,62 @@ class ChatService {
     return [lowerRaw]
   }
 
+  private resolveMessageIsSend(rawIsSend: number | null, senderUsername?: string | null): {
+    isSend: number | null
+    selfMatched: boolean
+    correctedBySelfIdentity: boolean
+  } {
+    const normalizedRawIsSend = Number.isFinite(rawIsSend as number) ? rawIsSend : null
+    const senderKeys = this.buildIdentityKeys(String(senderUsername || ''))
+    if (senderKeys.length === 0) {
+      return {
+        isSend: normalizedRawIsSend,
+        selfMatched: false,
+        correctedBySelfIdentity: false
+      }
+    }
+
+    const myWxid = String(this.configService.get('myWxid') || '').trim()
+    const selfKeys = this.buildIdentityKeys(myWxid)
+    if (selfKeys.length === 0) {
+      return {
+        isSend: normalizedRawIsSend,
+        selfMatched: false,
+        correctedBySelfIdentity: false
+      }
+    }
+
+    const selfMatched = senderKeys.some(senderKey =>
+      selfKeys.some(selfKey =>
+        senderKey === selfKey ||
+        senderKey.startsWith(selfKey + '_') ||
+        selfKey.startsWith(senderKey + '_')
+      )
+    )
+
+    if (selfMatched && normalizedRawIsSend !== 1) {
+      return {
+        isSend: 1,
+        selfMatched: true,
+        correctedBySelfIdentity: true
+      }
+    }
+
+    if (normalizedRawIsSend === null) {
+      return {
+        isSend: selfMatched ? 1 : 0,
+        selfMatched,
+        correctedBySelfIdentity: false
+      }
+    }
+
+    return {
+      isSend: normalizedRawIsSend,
+      selfMatched,
+      correctedBySelfIdentity: false
+    }
+  }
+
   private extractGroupMemberUsername(member: any): string {
     if (!member) return ''
     if (typeof member === 'string') return member.trim()
@@ -3048,9 +3106,6 @@ class ChatService {
 
   private mapRowsToMessages(rows: Record<string, any>[]): Message[] {
     const myWxid = this.configService.get('myWxid')
-    const cleanedWxid = myWxid ? this.cleanAccountDirName(myWxid) : null
-    const myWxidLower = myWxid ? myWxid.toLowerCase() : null
-    const cleanedWxidLower = cleanedWxid ? cleanedWxid.toLowerCase() : null
 
     const messages: Message[] = []
     for (const row of rows) {
@@ -3075,30 +3130,14 @@ class ChatService {
       const content = this.decodeMessageContent(rawMessageContent, rawCompressContent);
       const localType = this.getRowInt(row, ['local_type', 'localType', 'type', 'msg_type', 'msgType', 'WCDB_CT_local_type'], 1)
       const isSendRaw = this.getRowField(row, ['computed_is_send', 'computedIsSend', 'is_send', 'isSend', 'WCDB_CT_is_send'])
-      let isSend = isSendRaw === null ? null : parseInt(isSendRaw, 10)
+      const parsedRawIsSend = isSendRaw === null ? null : parseInt(isSendRaw, 10)
       const senderUsername = this.getRowField(row, ['sender_username', 'senderUsername', 'sender', 'WCDB_CT_sender_username'])
         || this.extractSenderUsernameFromContent(content)
         || null
+      const { isSend } = this.resolveMessageIsSend(parsedRawIsSend, senderUsername)
       const createTime = this.getRowInt(row, ['create_time', 'createTime', 'createtime', 'msg_create_time', 'msgCreateTime', 'msg_time', 'msgTime', 'time', 'WCDB_CT_create_time'], 0)
 
-      if (senderUsername && (myWxidLower || cleanedWxidLower)) {
-        const senderLower = String(senderUsername).toLowerCase()
-        const expectedIsSend = (
-          senderLower === myWxidLower ||
-          senderLower === cleanedWxidLower ||
-          // 兼容非 wxid 开头的账号（如果文件夹名带后缀，如 custom_backup，而 sender 是 custom）
-          (myWxidLower && myWxidLower.startsWith(senderLower + '_')) ||
-          (cleanedWxidLower && cleanedWxidLower.startsWith(senderLower + '_'))
-        ) ? 1 : 0
-        if (isSend === null) {
-          isSend = expectedIsSend
-          // [DEBUG] Issue #34: 记录 isSend 推断过程
-          if (expectedIsSend === 0 && localType === 1) {
-            // 仅在被判为接收且是文本消息时记录，避免刷屏
-            // 
-          }
-        }
-      } else if (senderUsername && !myWxid) {
+      if (senderUsername && !myWxid) {
         // [DEBUG] Issue #34: 未配置 myWxid，无法判断是否发送
         if (messages.length < 5) {
           console.warn(`[ChatService] Warning: myWxid not set. Cannot determine if message is sent by me. sender=${senderUsername}`)
@@ -4419,6 +4458,75 @@ class ChatService {
     )
     if (!result.success || !result.rows || result.rows.length === 0) return null
     return result.rows[0]?.name || null
+  }
+
+  private async resolveMessageName2IdTableName(dbPath: string): Promise<string | null> {
+    const normalizedDbPath = String(dbPath || '').trim()
+    if (!normalizedDbPath) return null
+    if (this.messageName2IdTableCache.has(normalizedDbPath)) {
+      return this.messageName2IdTableCache.get(normalizedDbPath) || null
+    }
+
+    const result = await wcdbService.execQuery(
+      'message',
+      normalizedDbPath,
+      "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Name2Id%' ORDER BY name DESC LIMIT 1"
+    )
+    const tableName = result.success && result.rows && result.rows.length > 0
+      ? String(result.rows[0]?.name || '').trim() || null
+      : null
+    this.messageName2IdTableCache.set(normalizedDbPath, tableName)
+    return tableName
+  }
+
+  private async resolveMessageSenderUsernameById(dbPath: string, senderId: unknown): Promise<string | null> {
+    const normalizedDbPath = String(dbPath || '').trim()
+    const numericSenderId = Number.parseInt(String(senderId ?? '').trim(), 10)
+    if (!normalizedDbPath || !Number.isFinite(numericSenderId) || numericSenderId <= 0) {
+      return null
+    }
+
+    const cacheKey = `${normalizedDbPath}::${numericSenderId}`
+    if (this.messageSenderIdCache.has(cacheKey)) {
+      return this.messageSenderIdCache.get(cacheKey) || null
+    }
+
+    const name2IdTable = await this.resolveMessageName2IdTableName(normalizedDbPath)
+    if (!name2IdTable) {
+      this.messageSenderIdCache.set(cacheKey, null)
+      return null
+    }
+
+    const escapedTableName = String(name2IdTable).replace(/"/g, '""')
+    const result = await wcdbService.execQuery(
+      'message',
+      normalizedDbPath,
+      `SELECT user_name FROM "${escapedTableName}" WHERE rowid = ${numericSenderId} LIMIT 1`
+    )
+    const username = result.success && result.rows && result.rows.length > 0
+      ? String(result.rows[0]?.user_name || result.rows[0]?.userName || '').trim() || null
+      : null
+    this.messageSenderIdCache.set(cacheKey, username)
+    return username
+  }
+
+  private async resolveSenderUsernameForMessageRow(
+    row: Record<string, any>,
+    rawContent: string
+  ): Promise<string | null> {
+    const directSender = this.getRowField(row, ['sender_username', 'senderUsername', 'sender', 'WCDB_CT_sender_username'])
+      || this.extractSenderUsernameFromContent(rawContent)
+    if (directSender) {
+      return directSender
+    }
+
+    const dbPath = this.getRowField(row, ['db_path', 'dbPath', '_db_path'])
+    const realSenderId = this.getRowField(row, ['real_sender_id', 'realSenderId'])
+    if (!dbPath || realSenderId === null || realSenderId === undefined || String(realSenderId).trim() === '') {
+      return null
+    }
+
+    return this.resolveMessageSenderUsernameById(String(dbPath), realSenderId)
   }
 
   /**
@@ -6690,7 +6798,7 @@ class ChatService {
             db_path: dbPath,
             table_name: tableName
           }
-          const message = this.parseMessage(row)
+          const message = await this.parseMessage(row, { source: 'detail', sessionId })
 
           if (message.localId !== 0) {
             return { success: true, message }
@@ -6711,7 +6819,45 @@ class ChatService {
       if (!result.success || !result.messages) {
         return { success: false, error: result.error || '搜索失败' }
       }
-      const messages = result.messages.map((row: any) => this.parseMessage(row)).filter(Boolean) as Message[]
+      const messages: Message[] = []
+      const isGroupSearch = Boolean(String(sessionId || '').trim().endsWith('@chatroom'))
+
+      for (const row of result.messages) {
+        let message = await this.parseMessage(row, { source: 'search', sessionId })
+        const needsDetailHydration = isGroupSearch &&
+          Boolean(sessionId) &&
+          message.localId > 0 &&
+          (!message.senderUsername || message.isSend === null)
+
+        if (needsDetailHydration && sessionId) {
+          const detail = await this.getMessageById(sessionId, message.localId)
+          if (detail.success && detail.message) {
+            message = {
+              ...message,
+              ...detail.message,
+              parsedContent: message.parsedContent || detail.message.parsedContent,
+              rawContent: message.rawContent || detail.message.rawContent,
+              content: message.content || detail.message.content
+            }
+          }
+        }
+
+        if (isGroupSearch && (needsDetailHydration || message.isSend === 1)) {
+          console.info('[ChatService][GroupSearchHydratedHit]', {
+            sessionId,
+            localId: message.localId,
+            senderUsername: message.senderUsername,
+            isSend: message.isSend,
+            senderDisplayName: message.senderDisplayName,
+            senderAvatarUrl: message.senderAvatarUrl,
+            usedDetailHydration: needsDetailHydration,
+            parsedContent: message.parsedContent
+          })
+        }
+
+        messages.push(message)
+      }
+
       return { success: true, messages }
     } catch (e) {
       console.error('ChatService: searchMessages 失败:', e)
@@ -6719,7 +6865,7 @@ class ChatService {
     }
   }
 
-  private parseMessage(row: any): Message {
+  private async parseMessage(row: any, options?: { source?: 'search' | 'detail'; sessionId?: string }): Promise<Message> {
     const sourceInfo = this.getMessageSourceInfo(row)
     const rawContent = this.decodeMessageContent(
       this.getRowField(row, [
@@ -6746,9 +6892,9 @@ class ChatService {
     const localType = this.getRowInt(row, ['local_type', 'localType', 'type', 'msg_type', 'msgType', 'WCDB_CT_local_type'], 0)
     const createTime = this.getRowInt(row, ['create_time', 'createTime', 'createtime', 'msg_create_time', 'msgCreateTime', 'msg_time', 'msgTime', 'time', 'WCDB_CT_create_time'], 0)
     const sortSeq = this.getRowInt(row, ['sort_seq', 'sortSeq', 'seq', 'sequence', 'WCDB_CT_sort_seq'], createTime)
-    const senderUsername = this.getRowField(row, ['sender_username', 'senderUsername', 'sender', 'WCDB_CT_sender_username'])
-      || this.extractSenderUsernameFromContent(rawContent)
-      || null
+    const rawIsSend = this.getRowField(row, ['computed_is_send', 'computedIsSend', 'is_send', 'isSend', 'WCDB_CT_is_send'])
+    const senderUsername = await this.resolveSenderUsernameForMessageRow(row, rawContent)
+    const sendState = this.resolveMessageIsSend(rawIsSend === null ? null : parseInt(rawIsSend, 10), senderUsername)
     const msg: Message = {
       messageKey: this.buildMessageKey({
         localId,
@@ -6764,7 +6910,7 @@ class ChatService {
       localType,
       createTime,
       sortSeq,
-      isSend: this.getRowInt(row, ['computed_is_send', 'computedIsSend', 'is_send', 'isSend', 'WCDB_CT_is_send'], 0),
+      isSend: sendState.isSend,
       senderUsername,
       rawContent: rawContent,
       content: rawContent,  // 添加原始内容供视频MD5解析使用
@@ -6782,6 +6928,19 @@ class ChatService {
         val_create_time: row['create_time'],
         rawCreateTime,
         rawCreateTimeType: rawCreateTime ? typeof rawCreateTime : 'null'
+      })
+    }
+
+    if (options?.source === 'search' && String(options.sessionId || '').endsWith('@chatroom') && sendState.selfMatched) {
+      console.info('[ChatService][GroupSearchSelfHit]', {
+        sessionId: options.sessionId,
+        localId,
+        createTime,
+        senderUsername,
+        rawIsSend,
+        resolvedIsSend: sendState.isSend,
+        correctedBySelfIdentity: sendState.correctedBySelfIdentity,
+        rowKeys: Object.keys(row)
       })
     }
 
