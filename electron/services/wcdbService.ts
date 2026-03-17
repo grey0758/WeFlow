@@ -158,6 +158,13 @@ export class WcdbService {
   }
 
   /**
+   * 设置新版 Weixin 4.x 多密钥（在 open 前调用，由 main.ts 透传）
+   */
+  setWcdbKeys(wcdbKeys: Record<string, string>): void {
+    this.callWorker('setWcdbKeys', { wcdbKeys }).catch(() => {})
+  }
+
+  /**
    * 打开数据库
    */
   async open(dbPath: string, hexKey: string, wxid: string): Promise<boolean> {

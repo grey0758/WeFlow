@@ -1,6 +1,7 @@
 ﻿import { join, dirname, basename } from 'path'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
+import { pyWxDumpService } from './pyWxDumpService'
 
 // DLL 初始化错误信息，用于帮助用户诊断问题
 let lastDllInitError: string | null = null
@@ -62,6 +63,16 @@ export class WcdbCore {
   private currentKey: string | null = null
   private currentWxid: string | null = null
   private currentDbStoragePath: string | null = null
+
+  // --------------- PyWxDump fallback 模式 ---------------
+  // DLL 不可用时，通过 PyWxDump 解密数据库后用 better-sqlite3 直接读取
+  private fallbackMode = false
+  private fallbackDecryptedDir: string | null = null
+  // better-sqlite3 连接缓存: 解密后文件路径 -> Database 实例
+  private fallbackDbs: Map<string, any> = new Map()
+  // wcdbKeys: 新版 Weixin 4.x 每个 DB 独立密钥 { salt_hex: key_hex }
+  private currentWcdbKeys: Record<string, string> | null = null
+  // -------------------------------------------------------
 
   // 函数引用
   private wcdbInitProtection: any = null
@@ -537,6 +548,13 @@ export class WcdbCore {
   async initialize(): Promise<boolean> {
     if (this.initialized) return true
 
+    // ── PyWxDump 彻底替换模式：完全跳过 DLL 加载 ──
+    this.writeLog('[bootstrap] PyWxDump mode: skipping DLL, using better-sqlite3', true)
+    this.fallbackMode = true
+    this.initialized = true
+    return true
+
+    // eslint-disable-next-line no-unreachable
     try {
       this.koffi = require('koffi')
       const dllPath = this.getDllPath()
@@ -932,7 +950,12 @@ export class WcdbCore {
       } else if (errorMsg.includes('193') || errorMsg.includes('不是有效的 Win32 应用程序')) {
         lastDllInitError = 'DLL 架构不匹配。请确保使用 64 位版本的应用程序。'
       }
-      return false
+
+      // DLL 失败时激活 PyWxDump fallback 模式
+      this.writeLog('DLL 初始化失败，切换到 PyWxDump fallback 模式', true)
+      this.fallbackMode = true
+      this.initialized = true   // 标记为"已初始化（fallback 模式）"
+      return true
     }
   }
 
@@ -1108,6 +1131,9 @@ export class WcdbCore {
   }
 
   private ensureReady(): boolean {
+    if (this.fallbackMode) {
+      return this.initialized && this.fallbackDecryptedDir !== null
+    }
     return this.initialized && this.handle !== null
   }
 
@@ -1137,6 +1163,16 @@ export class WcdbCore {
     return this.ensureReady()
   }
 
+  /** 设置新版 Weixin 4.x 多密钥（在 open 前调用） */
+  setWcdbKeys(wcdbKeys: Record<string, string>): void {
+    this.currentWcdbKeys = wcdbKeys
+  }
+
+  /** 当前是否运行在 PyWxDump fallback 模式下 */
+  isFallbackMode(): boolean {
+    return this.fallbackMode
+  }
+
   /**
    * 打开数据库
    */
@@ -1145,6 +1181,11 @@ export class WcdbCore {
       if (!this.initialized) {
         const initOk = await this.initialize()
         if (!initOk) return false
+      }
+
+      // fallback 模式：用 PyWxDump 解密数据库后直接读取
+      if (this.fallbackMode) {
+        return this.openFallback(dbPath, hexKey, wxid)
       }
 
       // 检查是否已经是当前连接的参数，如果是则直接返回成功，实现"始终保持链接"
@@ -1187,12 +1228,20 @@ export class WcdbCore {
         console.error('打开数据库失败:', result)
         await this.printLogs()
         this.writeLog(`open failed: openAccount code=${result}`)
-        return false
+
+        // DLL 打开失败时自动切换到 fallback 模式
+        this.writeLog('DLL 打开数据库失败，切换到 PyWxDump fallback 模式', true)
+        this.fallbackMode = true
+        this.handle = null
+        return this.openFallback(dbPath, hexKey, wxid)
       }
 
       const handle = handleOut[0]
       if (handle <= 0) {
-        return false
+        // 同上，handle 无效时切换 fallback
+        this.writeLog('DLL 返回无效 handle，切换到 PyWxDump fallback 模式', true)
+        this.fallbackMode = true
+        return this.openFallback(dbPath, hexKey, wxid)
       }
 
       this.handle = handle
@@ -1223,14 +1272,309 @@ export class WcdbCore {
   }
 
   /**
+   * fallback 模式下的 open：调用 PyWxDump 解密数据库到临时目录，之后所有查询走 better-sqlite3
+   */
+  private async openFallback(dbPath: string, hexKey: string, wxid: string): Promise<boolean> {
+    try {
+      // 参数不变时复用已解密目录
+      if (this.fallbackDecryptedDir &&
+          this.currentPath === dbPath &&
+          this.currentWxid === wxid &&
+          existsSync(this.fallbackDecryptedDir)) {
+        this.writeLog('openFallback: 复用已解密目录', true)
+        return true
+      }
+
+      // 关闭旧的 better-sqlite3 连接
+      this.closeFallbackDbs()
+
+      const dbStoragePath = this.resolveDbStoragePath(dbPath, wxid)
+      this.writeLog(`openFallback dbPath=${dbPath} wxid=${wxid} dbStorage=${dbStoragePath || 'null'}`, true)
+
+      if (!dbStoragePath || !existsSync(dbStoragePath)) {
+        this.writeLog(`openFallback failed: dbStorage not found`, true)
+        return false
+      }
+
+      // 解密输出目录
+      const outDir = pyWxDumpService.makeDecryptedDir(wxid || 'unknown')
+      this.writeLog(`openFallback decrypting to ${outDir}`, true)
+
+      // hexKey 可能是单 key（旧版）或者 wcdbKeys JSON（新版）
+      const keyArg = this.currentWcdbKeys
+        ? JSON.stringify(this.currentWcdbKeys)
+        : hexKey
+
+      const result = await pyWxDumpService.decryptDbDir(
+        keyArg,
+        dbStoragePath,
+        outDir,
+        (msg) => this.writeLog(`openFallback: ${msg}`, true)
+      )
+
+      if (!result.success) {
+        this.writeLog(`openFallback decrypt failed: ${result.error}`, true)
+        return false
+      }
+
+      this.currentPath = dbPath
+      this.currentKey = hexKey
+      this.currentWxid = wxid
+      this.currentDbStoragePath = dbStoragePath
+      this.fallbackDecryptedDir = outDir
+      this.writeLog(`openFallback ok: decrypted=${result.decrypted} failed=${result.failed}`, true)
+      return true
+    } catch (e) {
+      this.writeLog(`openFallback exception: ${String(e)}`, true)
+      return false
+    }
+  }
+
+  /** 关闭所有 better-sqlite3 连接 */
+  private closeFallbackDbs(): void {
+    for (const [, db] of this.fallbackDbs) {
+      try { db.close() } catch {}
+    }
+    this.fallbackDbs.clear()
+  }
+
+  /**
+   * fallback 模式下，根据 db_kind 找到对应的解密文件并打开 better-sqlite3 连接
+   * kind 示例: "contact" | "message" | "session" | "misc" | 绝对路径
+   */
+  private getFallbackDb(kind: string | null, pathHint: string | null): any | null {
+    if (!this.fallbackDecryptedDir) return null
+
+    // 优先按 pathHint（绝对路径或相对路径）查找
+    if (pathHint) {
+      const hintName = pathHint.replace(/\\/g, '/').split('/').pop() || ''
+      const deName = hintName.startsWith('de_') ? hintName : `de_${hintName}`
+      const found = this.findDecryptedFile(deName)
+      if (found) return this.openFallbackDb(found)
+    }
+
+    // 按 kind 映射常见文件名
+    const kindMap: Record<string, string[]> = {
+      'session':  ['de_session.db', 'de_Session.db'],
+      'contact':  ['de_contact.db', 'de_Contact.db', 'de_session.db'],
+      'message':  ['de_message_0.db', 'de_msg_0.db'],
+      'misc':     ['de_misc.db', 'de_Misc.db'],
+      'sns':      ['de_SNS.db', 'de_sns.db'],
+    }
+
+    const candidates = kind ? (kindMap[kind.toLowerCase()] ?? []) : []
+    for (const name of candidates) {
+      const found = this.findDecryptedFile(name)
+      if (found) return this.openFallbackDb(found)
+    }
+
+    // 兜底：返回第一个找到的 .db 文件
+    try {
+      const walk = (dir: string): string | null => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          const full = join(dir, entry.name)
+          if (entry.isDirectory()) { const f = walk(full); if (f) return f }
+          else if (entry.isFile() && entry.name.startsWith('de_') && entry.name.endsWith('.db')) return full
+        }
+        return null
+      }
+      const fallback = walk(this.fallbackDecryptedDir)
+      if (fallback) return this.openFallbackDb(fallback)
+    } catch {}
+
+    return null
+  }
+
+  /** 在解密目录中递归查找指定文件名 */
+  private findDecryptedFile(name: string): string | null {
+    if (!this.fallbackDecryptedDir) return null
+    const walk = (dir: string): string | null => {
+      try {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          const full = join(dir, entry.name)
+          if (entry.isDirectory()) { const f = walk(full); if (f) return f }
+          else if (entry.isFile() && entry.name.toLowerCase() === name.toLowerCase()) return full
+        }
+      } catch {}
+      return null
+    }
+    return walk(this.fallbackDecryptedDir)
+  }
+
+  /** 打开或复用 better-sqlite3 连接 */
+  private openFallbackDb(filePath: string): any | null {
+    if (this.fallbackDbs.has(filePath)) return this.fallbackDbs.get(filePath)
+    try {
+      const BetterSqlite3 = require('better-sqlite3')
+      const db = new BetterSqlite3(filePath, { readonly: true, fileMustExist: true })
+      this.fallbackDbs.set(filePath, db)
+      return db
+    } catch (e) {
+      this.writeLog(`openFallbackDb failed ${filePath}: ${String(e)}`, true)
+      return null
+    }
+  }
+
+  /**
+   * fallback 模式下的通用 SQL 查询
+   * 返回与 DLL execQuery 相同格式的结果
+   */
+  private execQueryFallback(
+    kind: string | null,
+    pathHint: string | null,
+    sql: string
+  ): { success: boolean; rows?: any[]; error?: string } {
+    try {
+      const db = this.getFallbackDb(kind, pathHint)
+      if (!db) {
+        return { success: false, error: `fallback: 未找到对应数据库 kind=${kind} hint=${pathHint}` }
+      }
+      const rows = db.prepare(sql).all()
+      return { success: true, rows }
+    } catch (e) {
+      return { success: false, error: `fallback SQL 失败: ${String(e)}\nSQL: ${sql}` }
+    }
+  }
+
+  /**
+   * fallback 模式下打开消息游标（内存游标，一次性加载）
+   */
+  private _fallbackCursors: Map<number, { rows: any[]; index: number; batchSize: number }> = new Map()
+  private _fallbackCursorSeq = 1
+
+  private openMessageCursorFallback(
+    sessionId: string,
+    batchSize: number,
+    ascending: boolean,
+    beginTimestamp: number,
+    endTimestamp: number
+  ): { success: boolean; cursor?: number; error?: string } {
+    try {
+      // 查找消息数据库（遍历 de_message_*.db 文件）
+      const allRows: any[] = []
+      const decryptedDir = this.fallbackDecryptedDir
+      if (!decryptedDir) return { success: false, error: 'fallback 未初始化' }
+
+      const walk = (dir: string) => {
+        try {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name)
+            if (entry.isDirectory()) { walk(full); continue }
+            if (!entry.isFile()) continue
+            const lower = entry.name.toLowerCase()
+            if (!lower.startsWith('de_') || !lower.endsWith('.db')) continue
+
+            const db = this.openFallbackDb(full)
+            if (!db) continue
+
+            try {
+              // 检查是否有 message 表且包含该 session
+              const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+              const tableName = tables.find((t: any) => {
+                // Chat_<sessionId_encoded> 形式
+                return t.name.includes(sessionId.replace('@', '_').replace('.', '_'))
+              })?.name
+
+              if (!tableName) continue
+
+              let whereClauses = ''
+              const params: any[] = []
+              if (beginTimestamp > 0) { whereClauses += ` AND CreateTime >= ?`; params.push(beginTimestamp) }
+              if (endTimestamp > 0)   { whereClauses += ` AND CreateTime <= ?`; params.push(endTimestamp) }
+
+              const order = ascending ? 'ASC' : 'DESC'
+              const rows: any[] = db.prepare(
+                `SELECT * FROM "${tableName}" WHERE 1=1${whereClauses} ORDER BY CreateTime ${order}`
+              ).all(...params)
+              allRows.push(...rows)
+            } catch {}
+          }
+        } catch {}
+      }
+      walk(decryptedDir)
+
+      const cursorId = this._fallbackCursorSeq++
+      this._fallbackCursors.set(cursorId, { rows: allRows, index: 0, batchSize })
+      return { success: true, cursor: cursorId }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /**
+   * fallback 模式下的聚合统计：统计各 session 在时间范围内的消息数
+   */
+  private async _getAggregateStatsFallback(
+    sessionIds: string[],
+    begin: number,
+    end: number
+  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const decryptedDir = this.fallbackDecryptedDir
+      if (!decryptedDir) return { success: false, error: 'fallback 未初始化' }
+      const sessionStats: Record<string, { count: number; minTime: number; maxTime: number }> = {}
+      for (const sid of sessionIds) {
+        sessionStats[sid] = { count: 0, minTime: 0, maxTime: 0 }
+      }
+      const walk = (dir: string) => {
+        try {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name)
+            if (entry.isDirectory()) { walk(full); continue }
+            if (!entry.isFile() || !entry.name.startsWith('de_') || !entry.name.endsWith('.db')) continue
+            const db = this.openFallbackDb(full)
+            if (!db) continue
+            try {
+              const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+              for (const t of tables) {
+                const matchSid = sessionIds.find(sid => t.name.includes(sid.replace('@', '_').replace('.', '_')))
+                if (!matchSid) continue
+                let where = 'WHERE 1=1'
+                if (begin > 0) where += ` AND CreateTime >= ${begin}`
+                if (end > 0) where += ` AND CreateTime <= ${end}`
+                const stat: any = db.prepare(`SELECT COUNT(1) AS cnt, MIN(CreateTime) AS minT, MAX(CreateTime) AS maxT FROM "${t.name}" ${where}`).get()
+                if (stat) {
+                  sessionStats[matchSid].count += stat.cnt ?? 0
+                  if (stat.minT && (!sessionStats[matchSid].minTime || stat.minT < sessionStats[matchSid].minTime))
+                    sessionStats[matchSid].minTime = stat.minT
+                  if (stat.maxT && stat.maxT > sessionStats[matchSid].maxTime)
+                    sessionStats[matchSid].maxTime = stat.maxT
+                }
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+      walk(decryptedDir)
+      const total = Object.values(sessionStats).reduce((s, v) => s + v.count, 0)
+      return {
+        success: true,
+        data: {
+          total,
+          sessions: Object.entries(sessionStats).map(([sessionId, s]) => ({ sessionId, ...s })),
+          begin,
+          end,
+        }
+      }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /**
    * 关闭数据库
    * 注意：wcdb_close_account 可能导致崩溃，使用 shutdown 代替
    */
   close(): void {
+    // 清理 fallback 模式资源
+    this.closeFallbackDbs()
+    this._fallbackCursors.clear()
+    this.fallbackDecryptedDir = null
+
     if (this.handle !== null || this.initialized) {
       try {
         // 不调用 closeAccount，直接 shutdown
-        this.wcdbShutdown()
+        if (!this.fallbackMode) this.wcdbShutdown()
       } catch (e) {
         console.error('WCDB shutdown 出错:', e)
       }
@@ -1240,6 +1584,8 @@ export class WcdbCore {
       this.currentWxid = null
       this.currentDbStoragePath = null
       this.initialized = false
+      this.fallbackMode = false
+      this.currentWcdbKeys = null
       this.stopLogPolling()
     }
   }
@@ -1264,6 +1610,14 @@ export class WcdbCore {
       return { success: false, error: 'WCDB 未连接' }
     }
     try {
+      // fallback 模式
+      if (this.fallbackMode) {
+        const r = this.execQueryFallback('session', null,
+          `SELECT * FROM SessionAbstract ORDER BY nOrder DESC`)
+        if (!r.success) return { success: false, error: r.error }
+        return { success: true, sessions: r.rows ?? [] }
+      }
+
       // 使用 setImmediate 让事件循环有机会处理其他任务，避免长时间阻塞
       await new Promise(resolve => setImmediate(resolve))
 
@@ -1291,6 +1645,19 @@ export class WcdbCore {
   async getMessages(sessionId: string, limit: number, offset: number): Promise<{ success: boolean; messages?: any[]; error?: string }> {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
+    }
+    // fallback: 复用游标机制
+    if (this.fallbackMode) {
+      const openRes = await this.openMessageCursor(sessionId, limit, false, 0, 0)
+      if (!openRes.success || openRes.cursor == null) return { success: false, error: openRes.error }
+      try {
+        const state = this._fallbackCursors.get(openRes.cursor)
+        if (!state) return { success: false, error: '游标创建失败' }
+        const messages = state.rows.slice(offset, offset + limit)
+        return { success: true, messages }
+      } finally {
+        this._fallbackCursors.delete(openRes.cursor)
+      }
     }
     try {
       const outPtr = [null as any]
@@ -1342,6 +1709,15 @@ export class WcdbCore {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
     }
+    // fallback: 打开游标后读总行数
+    if (this.fallbackMode) {
+      const openRes = await this.openMessageCursor(sessionId, 999999, false, 0, 0)
+      if (!openRes.success || openRes.cursor == null) return { success: true, count: 0 }
+      const state = this._fallbackCursors.get(openRes.cursor)
+      const count = state ? state.rows.length : 0
+      this._fallbackCursors.delete(openRes.cursor)
+      return { success: true, count }
+    }
     try {
       const outCount = [0]
       const result = this.wcdbGetMessageCount(this.handle, sessionId, outCount)
@@ -1370,6 +1746,16 @@ export class WcdbCore {
       return { success: true, counts: {} }
     }
 
+    // fallback
+    if (this.fallbackMode) {
+      const counts: Record<string, number> = {}
+      for (const sessionId of normalizedSessionIds) {
+        const r = await this.getMessageCount(sessionId)
+        counts[sessionId] = r.count ?? 0
+      }
+      return { success: true, counts }
+    }
+
     try {
       const counts: Record<string, number> = {}
       for (let i = 0; i < normalizedSessionIds.length; i += 1) {
@@ -1394,25 +1780,32 @@ export class WcdbCore {
     }
     if (usernames.length === 0) return { success: true, map: {} }
     try {
-      if (process.platform === 'darwin') {
+      if (process.platform === 'darwin' || this.fallbackMode) {
         const uniq = Array.from(new Set(usernames.map((x) => String(x || '').trim()).filter(Boolean)))
         if (uniq.length === 0) return { success: true, map: {} }
         const inList = uniq.map((u) => `'${u.replace(/'/g, "''")}'`).join(',')
-        const sql = `SELECT * FROM contact WHERE username IN (${inList})`
-        const q = await this.execQuery('contact', null, sql)
-        if (!q.success) return { success: false, error: q.error || '获取昵称失败' }
-        const map: Record<string, string> = {}
-        for (const row of (q.rows || []) as Array<Record<string, any>>) {
-          const username = this.pickFirstStringField(row, ['username', 'user_name', 'userName'])
-          if (!username) continue
-          const display = this.pickFirstStringField(row, [
-            'remark', 'Remark',
-            'nick_name', 'nickName', 'nickname', 'NickName',
-            'alias', 'Alias'
-          ]) || username
-          map[username] = display
+        // 同时支持旧版（username 列）和新版 Weixin 4.x（UserName 列）
+        const sqlCandidates = [
+          `SELECT UserName, NickName, Remark FROM Contact WHERE UserName IN (${inList})`,
+          `SELECT username, nickName, remark FROM contact WHERE username IN (${inList})`,
+          `SELECT usrName, nickName, remark FROM contact WHERE usrName IN (${inList})`,
+        ]
+        let rows: any[] = []
+        for (const sql of sqlCandidates) {
+          const q = await this.execQuery('contact', null, sql)
+          if (q.success && q.rows?.length) { rows = q.rows; break }
         }
-        // 保证每个请求用户名至少有回退值
+        const map: Record<string, string> = {}
+        for (const row of rows as Array<Record<string, any>>) {
+          const uname = this.pickFirstStringField(row, ['UserName', 'username', 'user_name', 'usrName'])
+          if (!uname) continue
+          const display = this.pickFirstStringField(row, [
+            'Remark', 'remark',
+            'NickName', 'nickName', 'nickname',
+            'Alias', 'alias'
+          ]) || uname
+          map[uname] = display
+        }
         for (const u of uniq) {
           if (!map[u]) map[u] = u
         }
@@ -1467,29 +1860,45 @@ export class WcdbCore {
         return { success: true, map: resultMap }
       }
 
-      if (process.platform === 'darwin') {
+      if (process.platform === 'darwin' || this.fallbackMode) {
         const inList = toFetch.map((u) => `'${u.replace(/'/g, "''")}'`).join(',')
-        const sql = `SELECT * FROM contact WHERE username IN (${inList})`
-        const q = await this.execQuery('contact', null, sql)
-        if (!q.success) {
-          if (Object.keys(resultMap).length > 0) {
-            return { success: true, map: resultMap, error: q.error || '获取头像失败' }
+
+        // Weixin 4.x：优先查 ContactHeadImgUrl 表
+        if (this.fallbackMode) {
+          const q2 = await this.execQuery('contact', null,
+            `SELECT usrName, bigHeadImgUrl, smallHeadImgUrl FROM ContactHeadImgUrl WHERE usrName IN (${inList})`)
+          if (q2.success) {
+            for (const row of (q2.rows || []) as Array<Record<string, any>>) {
+              const uname = this.pickFirstStringField(row, ['usrName', 'username'])
+              const url = this.pickFirstStringField(row, ['bigHeadImgUrl', 'smallHeadImgUrl'])
+              if (uname && url) {
+                resultMap[uname] = url
+                this.avatarUrlCache.set(uname, { url, updatedAt: now })
+              }
+            }
           }
-          return { success: false, error: q.error || '获取头像失败' }
         }
 
-        for (const row of (q.rows || []) as Array<Record<string, any>>) {
-          const username = this.pickFirstStringField(row, ['username', 'user_name', 'userName'])
-          if (!username) continue
-          const url = this.pickFirstStringField(row, [
-            'big_head_img_url', 'bigHeadImgUrl', 'bigHeadUrl', 'big_head_url',
-            'small_head_img_url', 'smallHeadImgUrl', 'smallHeadUrl', 'small_head_url',
-            'head_img_url', 'headImgUrl',
-            'avatar_url', 'avatarUrl'
-          ])
-          if (url) {
-            resultMap[username] = url
-            this.avatarUrlCache.set(username, { url, updatedAt: now })
+        // 仍然缺少头像的用户：再查 contact 表
+        const stillMissing = toFetch.filter(u => !resultMap[u])
+        if (stillMissing.length > 0) {
+          const inList2 = stillMissing.map((u) => `'${u.replace(/'/g, "''")}'`).join(',')
+          const q = await this.execQuery('contact', null, `SELECT * FROM contact WHERE username IN (${inList2})`)
+          if (q.success) {
+            for (const row of (q.rows || []) as Array<Record<string, any>>) {
+              const username = this.pickFirstStringField(row, ['username', 'user_name', 'userName'])
+              if (!username) continue
+              const url = this.pickFirstStringField(row, [
+                'big_head_img_url', 'bigHeadImgUrl', 'bigHeadUrl', 'big_head_url',
+                'small_head_img_url', 'smallHeadImgUrl', 'smallHeadUrl', 'small_head_url',
+                'head_img_url', 'headImgUrl',
+                'avatar_url', 'avatarUrl'
+              ])
+              if (url) {
+                resultMap[username] = url
+                this.avatarUrlCache.set(username, { url, updatedAt: now })
+              }
+            }
           }
         }
         return { success: true, map: resultMap }
@@ -1544,6 +1953,23 @@ export class WcdbCore {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
     }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const safe = chatroomId.replace(/'/g, "''")
+      const sqls = [
+        `SELECT COUNT(1) AS cnt FROM ChatRoomMember WHERE ChatRoomUserName='${safe}'`,
+        `SELECT memberList FROM ChatRoom WHERE chatroomUserName='${safe}'`,
+      ]
+      for (const sql of sqls) {
+        const r = await this.execQuery('contact', null, sql)
+        if (r.success && r.rows?.length) {
+          if (r.rows[0].cnt !== undefined) return { success: true, count: Number(r.rows[0].cnt) }
+          const ml = String(r.rows[0].memberList || '')
+          return { success: true, count: ml ? ml.split(';').filter(Boolean).length : 0 }
+        }
+      }
+      return { success: true, count: 0 }
+    }
     try {
       const outCount = [0]
       const result = this.wcdbGetGroupMemberCount(this.handle, chatroomId, outCount)
@@ -1590,6 +2016,25 @@ export class WcdbCore {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
     }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const safe = chatroomId.replace(/'/g, "''")
+      const sqls = [
+        `SELECT * FROM ChatRoomMember WHERE ChatRoomUserName='${safe}'`,
+        `SELECT memberList FROM ChatRoom WHERE chatroomUserName='${safe}'`,
+      ]
+      for (const sql of sqls) {
+        const r = await this.execQuery('contact', null, sql)
+        if (r.success && r.rows?.length) {
+          if (r.rows[0].memberList !== undefined) {
+            const members = String(r.rows[0].memberList || '').split(';').filter(Boolean).map((m: string) => ({ UserName: m }))
+            return { success: true, members }
+          }
+          return { success: true, members: r.rows }
+        }
+      }
+      return { success: true, members: [] }
+    }
     try {
       const outPtr = [null as any]
       const result = this.wcdbGetGroupMembers(this.handle, chatroomId, outPtr)
@@ -1610,6 +2055,21 @@ export class WcdbCore {
       return { success: false, error: 'WCDB 未连接' }
     }
     if (!this.wcdbGetGroupNicknames) {
+      // fallback 模式：从 ChatRoomMember 表查询群昵称
+      if (this.fallbackMode) {
+        const safe = chatroomId.replace(/'/g, "''")
+        const r = await this.execQuery('contact', null, `SELECT * FROM ChatRoomMember WHERE ChatRoomUserName='${safe}'`)
+        if (r.success && r.rows?.length) {
+          const nicknames: Record<string, string> = {}
+          for (const row of r.rows as Array<Record<string, any>>) {
+            const uname = this.pickFirstStringField(row, ['UserName', 'username', 'usrName'])
+            const nick = this.pickFirstStringField(row, ['NickName', 'nickName', 'displayName', 'RoomNickName'])
+            if (uname) nicknames[uname] = nick
+          }
+          return { success: true, nicknames }
+        }
+        return { success: true, nicknames: {} }
+      }
       return { success: false, error: '当前 DLL 版本不支持获取群昵称接口' }
     }
     try {
@@ -1650,6 +2110,32 @@ export class WcdbCore {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
     }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const seen = new Set<string>()
+      const decryptedDir = this.fallbackDecryptedDir
+      if (!decryptedDir) return { success: false, error: 'fallback 未初始化' }
+      const walk = (dir: string) => {
+        try {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name)
+            if (entry.isDirectory()) { walk(full); continue }
+            if (!entry.isFile() || !entry.name.startsWith('de_') || !entry.name.endsWith('.db')) continue
+            const db = this.openFallbackDb(full)
+            if (!db) continue
+            try {
+              const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+              const tbl = tables.find((t: any) => t.name.includes(sessionId.replace('@', '_').replace('.', '_')))?.name
+              if (!tbl) continue
+              const rows: any[] = db.prepare(`SELECT DISTINCT strftime('%Y-%m-%d', CreateTime, 'unixepoch') AS d FROM "${tbl}" WHERE CreateTime > 0`).all()
+              for (const row of rows) { if (row.d) seen.add(row.d) }
+            } catch {}
+          }
+        } catch {}
+      }
+      walk(decryptedDir)
+      return { success: true, dates: Array.from(seen).sort() }
+    }
     try {
       if (!this.wcdbGetMessageDates) {
         return { success: false, error: 'DLL 不支持 getMessageDates' }
@@ -1672,6 +2158,32 @@ export class WcdbCore {
   async getMessageTableStats(sessionId: string): Promise<{ success: boolean; tables?: any[]; error?: string }> {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
+    }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const tables: any[] = []
+      const decryptedDir = this.fallbackDecryptedDir
+      if (!decryptedDir) return { success: false, error: 'fallback 未初始化' }
+      const walk = (dir: string) => {
+        try {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name)
+            if (entry.isDirectory()) { walk(full); continue }
+            if (!entry.isFile() || !entry.name.startsWith('de_') || !entry.name.endsWith('.db')) continue
+            const db = this.openFallbackDb(full)
+            if (!db) continue
+            try {
+              const tList: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+              const tbl = tList.find((t: any) => t.name.includes(sessionId.replace('@', '_').replace('.', '_')))?.name
+              if (!tbl) continue
+              const cnt: any = db.prepare(`SELECT COUNT(1) AS cnt FROM "${tbl}"`).get()
+              tables.push({ tableName: tbl, count: cnt?.cnt ?? 0, dbPath: full })
+            } catch {}
+          }
+        } catch {}
+      }
+      walk(decryptedDir)
+      return { success: true, tables }
     }
     try {
       const outPtr = [null as any]
@@ -1712,17 +2224,14 @@ export class WcdbCore {
       return { success: false, error: 'WCDB 未连接' }
     }
     try {
-      if (process.platform === 'darwin') {
+      if (process.platform === 'darwin' || this.fallbackMode) {
         const safe = String(username || '').replace(/'/g, "''")
-        const sql = `SELECT * FROM contact WHERE username='${safe}' LIMIT 1`
-        const q = await this.execQuery('contact', null, sql)
-        if (!q.success) {
-          return { success: false, error: q.error || '获取联系人失败' }
+        let row: any = null
+        for (const col of ['username', 'UserName', 'usrName']) {
+          const q = await this.execQuery('contact', null, `SELECT * FROM contact WHERE ${col}='${safe}' LIMIT 1`)
+          if (q.success && Array.isArray(q.rows) && q.rows.length > 0) { row = q.rows[0]; break }
         }
-        const row = Array.isArray(q.rows) && q.rows.length > 0 ? q.rows[0] : null
-        if (!row) {
-          return { success: false, error: `联系人不存在: ${username}` }
-        }
+        if (!row) return { success: false, error: `联系人不存在: ${username}` }
         return { success: true, contact: row }
       }
 
@@ -1802,6 +2311,11 @@ export class WcdbCore {
         normalizedEnd = normalizedBegin
       }
 
+      // fallback 模式
+      if (this.fallbackMode) {
+        return this._getAggregateStatsFallback(sessionIds, normalizedBegin, normalizedEnd)
+      }
+
       const callAggregate = (ids: string[]) => {
         const idsAreNumeric = ids.length > 0 && ids.every((id) => /^\d+$/.test(id))
         const payloadIds = idsAreNumeric ? ids.map((id) => Number(id)) : ids
@@ -1850,10 +2364,39 @@ export class WcdbCore {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
     }
+    if (sessionIds.length === 0) return { success: true, data: [] }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const years: Set<number> = new Set()
+      const decryptedDir = this.fallbackDecryptedDir
+      if (decryptedDir) {
+        const walk = (dir: string) => {
+          try {
+            for (const entry of readdirSync(dir, { withFileTypes: true })) {
+              const full = join(dir, entry.name)
+              if (entry.isDirectory()) { walk(full); continue }
+              if (!entry.isFile() || !entry.name.startsWith('de_') || !entry.name.endsWith('.db')) continue
+              const db = this.openFallbackDb(full)
+              if (!db) continue
+              try {
+                const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+                for (const t of tables) {
+                  const hasSid = sessionIds.some(sid => t.name.includes(sid.replace('@', '_').replace('.', '_')))
+                  if (!hasSid) continue
+                  const rows: any[] = db.prepare(`SELECT DISTINCT CAST(strftime('%Y', CreateTime, 'unixepoch') AS INTEGER) AS yr FROM "${t.name}" WHERE CreateTime > 0`).all()
+                  for (const row of rows) { if (row.yr) years.add(row.yr) }
+                }
+              } catch {}
+            }
+          } catch {}
+        }
+        walk(decryptedDir)
+      }
+      return { success: true, data: Array.from(years).sort() }
+    }
     if (!this.wcdbGetAvailableYears) {
       return { success: false, error: '未支持获取年度列表' }
     }
-    if (sessionIds.length === 0) return { success: true, data: [] }
     try {
       const outPtr = [null as any]
       const result = this.wcdbGetAvailableYears(this.handle, JSON.stringify(sessionIds), outPtr)
@@ -1957,6 +2500,10 @@ export class WcdbCore {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
     }
+    // fallback 模式
+    if (this.fallbackMode) {
+      return this.openMessageCursorFallback(sessionId, batchSize, ascending, beginTimestamp, endTimestamp)
+    }
     try {
       const outCursor = [0]
       const result = this.wcdbOpenMessageCursor(
@@ -2022,6 +2569,15 @@ export class WcdbCore {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
     }
+    // fallback 模式：从内存游标取一批
+    if (this.fallbackMode) {
+      const state = this._fallbackCursors.get(cursor)
+      if (!state) return { success: false, error: `无效游标: ${cursor}` }
+      const { rows, index, batchSize } = state
+      const batch = rows.slice(index, index + batchSize)
+      state.index = index + batchSize
+      return { success: true, rows: batch, hasMore: state.index < rows.length }
+    }
     try {
       const outPtr = [null as any]
       const outHasMore = [0]
@@ -2041,6 +2597,11 @@ export class WcdbCore {
   async closeMessageCursor(cursor: number): Promise<{ success: boolean; error?: string }> {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
+    }
+    // fallback 模式：清理内存游标
+    if (this.fallbackMode) {
+      this._fallbackCursors.delete(cursor)
+      return { success: true }
     }
     try {
       const result = this.wcdbCloseMessageCursor(this.handle, cursor)
@@ -2075,6 +2636,11 @@ export class WcdbCore {
       return { success: false, error: 'WCDB 未连接' }
     }
     try {
+      // fallback 模式：直接用 better-sqlite3
+      if (this.fallbackMode) {
+        return this.execQueryFallback(kind, path, sql)
+      }
+
       if (!this.wcdbExecQuery) return { success: false, error: '接口未就绪' }
       
       // 如果提供了参数，使用参数化查询（需要 C++ 层支持）
@@ -2129,6 +2695,21 @@ export class WcdbCore {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
     }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const safeMd5 = md5.replace(/'/g, "''")
+      for (const sql of [
+        `SELECT cdnUrl FROM EmojiInfo WHERE md5='${safeMd5}' LIMIT 1`,
+        `SELECT CdnUrl FROM EmojiInfo WHERE Md5='${safeMd5}' LIMIT 1`,
+      ]) {
+        const r = this.execQueryFallback('misc', null, sql)
+        if (r.success && r.rows?.length) {
+          const url = r.rows[0].cdnUrl || r.rows[0].CdnUrl || ''
+          if (url) return { success: true, url }
+        }
+      }
+      return { success: false, error: '未找到表情 CDN URL' }
+    }
     try {
       const outPtr = [null as any]
       const result = this.wcdbGetEmoticonCdnUrl(this.handle, dbPath, md5, outPtr)
@@ -2145,6 +2726,24 @@ export class WcdbCore {
 
   async listMessageDbs(): Promise<{ success: boolean; data?: string[]; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const result: string[] = []
+      if (this.fallbackDecryptedDir) {
+        const walk = (dir: string) => {
+          try {
+            for (const entry of readdirSync(dir, { withFileTypes: true })) {
+              const full = join(dir, entry.name)
+              if (entry.isDirectory()) { walk(full); continue }
+              if (entry.isFile() && entry.name.toLowerCase().includes('message') && entry.name.endsWith('.db'))
+                result.push(full)
+            }
+          } catch {}
+        }
+        walk(this.fallbackDecryptedDir)
+      }
+      return { success: true, data: result }
+    }
     try {
       const outPtr = [null as any]
       const result = this.wcdbListMessageDbs(this.handle, outPtr)
@@ -2160,6 +2759,24 @@ export class WcdbCore {
 
   async listMediaDbs(): Promise<{ success: boolean; data?: string[]; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const result: string[] = []
+      if (this.fallbackDecryptedDir) {
+        const walk = (dir: string) => {
+          try {
+            for (const entry of readdirSync(dir, { withFileTypes: true })) {
+              const full = join(dir, entry.name)
+              if (entry.isDirectory()) { walk(full); continue }
+              if (entry.isFile() && /media|img|voice/i.test(entry.name) && entry.name.endsWith('.db'))
+                result.push(full)
+            }
+          } catch {}
+        }
+        walk(this.fallbackDecryptedDir)
+      }
+      return { success: true, data: result }
+    }
     try {
       const outPtr = [null as any]
       const result = this.wcdbListMediaDbs(this.handle, outPtr)
@@ -2171,8 +2788,37 @@ export class WcdbCore {
     } catch (e) {
       return { success: false, error: String(e) }
     }
-  } async getMessageById(sessionId: string, localId: number): Promise<{ success: boolean; message?: any; error?: string }> {
+  }
+
+  async getMessageById(sessionId: string, localId: number): Promise<{ success: boolean; message?: any; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const decryptedDir = this.fallbackDecryptedDir
+      if (!decryptedDir) return { success: false, error: 'fallback 未初始化' }
+      const walk = (dir: string): any | null => {
+        try {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name)
+            if (entry.isDirectory()) { const r = walk(full); if (r) return r }
+            if (!entry.isFile() || !entry.name.startsWith('de_') || !entry.name.endsWith('.db')) continue
+            const db = this.openFallbackDb(full)
+            if (!db) continue
+            try {
+              const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+              const tbl = tables.find((t: any) => t.name.includes(sessionId.replace('@', '_').replace('.', '_')))?.name
+              if (!tbl) continue
+              const row = db.prepare(`SELECT * FROM "${tbl}" WHERE localId=?`).get(localId)
+              if (row) return row
+            } catch {}
+          }
+        } catch {}
+        return null
+      }
+      const msg = walk(decryptedDir)
+      if (!msg) return { success: false, error: '未找到消息' }
+      return { success: true, message: msg }
+    }
     try {
       const outPtr = [null as any]
       const result = this.wcdbGetMessageById(this.handle, sessionId, localId, outPtr)
@@ -2289,6 +2935,39 @@ export class WcdbCore {
 
   async searchMessages(keyword: string, sessionId?: string, limit?: number, offset?: number, beginTimestamp?: number, endTimestamp?: number): Promise<{ success: boolean; messages?: any[]; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const messages: any[] = []
+      const decryptedDir = this.fallbackDecryptedDir
+      if (!decryptedDir) return { success: false, error: 'fallback 未初始化' }
+      const lim = limit || 50
+      const off = offset || 0
+      const likeStr = `%${keyword.replace(/'/g, "''")}%`
+      const walk = (dir: string) => {
+        try {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name)
+            if (entry.isDirectory()) { walk(full); continue }
+            if (!entry.isFile() || !entry.name.startsWith('de_') || !entry.name.endsWith('.db')) continue
+            const db = this.openFallbackDb(full)
+            if (!db) continue
+            try {
+              const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+              for (const t of tables) {
+                if (sessionId && !t.name.includes(sessionId.replace('@', '_').replace('.', '_'))) continue
+                let whereStr = `StrContent LIKE '${likeStr}'`
+                if (beginTimestamp) whereStr += ` AND CreateTime >= ${beginTimestamp}`
+                if (endTimestamp) whereStr += ` AND CreateTime <= ${endTimestamp}`
+                const rows: any[] = db.prepare(`SELECT * FROM "${t.name}" WHERE ${whereStr} ORDER BY CreateTime DESC LIMIT ${lim + off}`).all()
+                messages.push(...rows)
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+      walk(decryptedDir)
+      return { success: true, messages: messages.slice(off, off + lim) }
+    }
     if (!this.wcdbSearchMessages) return { success: false, error: '当前 DLL 版本不支持搜索消息' }
     try {
       const handle = this.handle
@@ -2319,6 +2998,19 @@ export class WcdbCore {
 
   async getSnsTimeline(limit: number, offset: number, usernames?: string[], keyword?: string, startTime?: number, endTime?: number): Promise<{ success: boolean; timeline?: any[]; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const sqlCandidates = [
+        `SELECT * FROM FeedsV20 ORDER BY createTime DESC LIMIT ${limit} OFFSET ${offset}`,
+        `SELECT * FROM Feeds ORDER BY createTime DESC LIMIT ${limit} OFFSET ${offset}`,
+        `SELECT * FROM SnsInfo ORDER BY createTime DESC LIMIT ${limit} OFFSET ${offset}`,
+      ]
+      for (const sql of sqlCandidates) {
+        const r = this.execQueryFallback('sns', null, sql)
+        if (r.success) return { success: true, timeline: r.rows ?? [] }
+      }
+      return { success: true, timeline: [] }
+    }
     if (!this.wcdbGetSnsTimeline) return { success: false, error: '当前 DLL 版本不支持获取朋友圈' }
     try {
       const outPtr = [null as any]
@@ -2348,6 +3040,20 @@ export class WcdbCore {
   async getSnsAnnualStats(beginTimestamp: number, endTimestamp: number): Promise<{ success: boolean; data?: any; error?: string }> {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
+    }
+    // fallback 模式
+    if (this.fallbackMode) {
+      const { begin, end } = this.normalizeRange(beginTimestamp, endTimestamp)
+      const sqlCandidates = [
+        `SELECT COUNT(1) AS total FROM FeedsV20 WHERE createTime >= ${begin} AND createTime <= ${end}`,
+        `SELECT COUNT(1) AS total FROM Feeds WHERE createTime >= ${begin} AND createTime <= ${end}`,
+        `SELECT COUNT(1) AS total FROM SnsInfo WHERE createTime >= ${begin} AND createTime <= ${end}`,
+      ]
+      for (const sql of sqlCandidates) {
+        const r = this.execQueryFallback('sns', null, sql)
+        if (r.success && r.rows?.length) return { success: true, data: { total: r.rows[0].total ?? 0 } }
+      }
+      return { success: true, data: { total: 0 } }
     }
     try {
       if (!this.wcdbGetSnsAnnualStats) {
@@ -2462,6 +3168,10 @@ export class WcdbCore {
       return { success: false, error: 'WCDB 未连接' }
     }
     if (!this.wcdbGetDualReportStats) {
+      if (this.fallbackMode) {
+        const { begin, end } = this.normalizeRange(beginTimestamp, endTimestamp)
+        return this._getAggregateStatsFallback([sessionId], begin, end)
+      }
       return { success: false, error: '未支持双人报告统计' }
     }
     try {

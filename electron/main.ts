@@ -30,6 +30,101 @@ import { httpService } from './services/httpService'
 
 
 // 配置自动更新
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+function normalizeLoopbackUrl(url: string): string {
+  try {
+    const normalizedUrl = new URL(url)
+    if (normalizedUrl.hostname === 'localhost') {
+      normalizedUrl.hostname = '127.0.0.1'
+    }
+    return normalizedUrl.toString()
+  } catch {
+    return url.replace('://localhost', '://127.0.0.1')
+  }
+}
+
+function getDevServerUrl(): string | null {
+  const serverUrl = process.env.VITE_DEV_SERVER_URL
+  if (!serverUrl) return null
+  return normalizeLoopbackUrl(serverUrl)
+}
+
+async function waitForDevServerReady(timeoutMs = 30000, intervalMs = 250): Promise<void> {
+  const serverUrl = getDevServerUrl()
+  if (!serverUrl) return
+
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown = null
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(serverUrl, {
+        signal: AbortSignal.timeout(2000)
+      })
+
+      if (response.ok) return
+    } catch (error) {
+      lastError = error
+    }
+
+    await sleep(intervalMs)
+  }
+
+  console.warn('[WeFlow] Dev server was not ready before window creation:', lastError)
+}
+
+function loadDevWindowURL(win: BrowserWindow, url: string, maxRetries = 40, retryDelayMs = 250) {
+  const normalizedUrl = normalizeLoopbackUrl(url)
+  let attempts = 0
+  let retryTimer: NodeJS.Timeout | null = null
+
+  const cleanup = () => {
+    if (retryTimer) {
+      clearTimeout(retryTimer)
+      retryTimer = null
+    }
+    win.webContents.removeListener('did-fail-load', handleFail)
+    win.webContents.removeListener('did-finish-load', handleFinish)
+    win.removeListener('closed', cleanup)
+  }
+
+  const scheduleRetry = () => {
+    if (attempts >= maxRetries || win.isDestroyed()) {
+      console.warn('[WeFlow] Failed to load dev window URL:', normalizedUrl)
+      cleanup()
+      return
+    }
+
+    attempts += 1
+    retryTimer = setTimeout(() => {
+      retryTimer = null
+      void win.loadURL(normalizedUrl).catch(() => {})
+    }, retryDelayMs)
+  }
+
+  const handleFail = (_event: Event, errorCode: number, errorDescription: string, validatedURL: string, isMainFrame: boolean) => {
+    if (!isMainFrame || validatedURL !== normalizedUrl || win.isDestroyed()) return
+
+    if (errorCode === -324 || errorCode === -102 || errorCode === -105 || errorCode === -106) {
+      scheduleRetry()
+      return
+    }
+
+    console.warn('[WeFlow] Dev window load failed:', { url: normalizedUrl, errorCode, errorDescription })
+  }
+
+  const handleFinish = () => {
+    cleanup()
+  }
+
+  win.webContents.on('did-fail-load', handleFail)
+  win.webContents.on('did-finish-load', handleFinish)
+  win.on('closed', cleanup)
+
+  void win.loadURL(normalizedUrl).catch(() => {})
+}
+
 autoUpdater.autoDownload = false
 autoUpdater.autoInstallOnAppQuit = true
 autoUpdater.disableDifferentialDownload = true  // 禁用差分更新，强制全量下载
@@ -165,7 +260,7 @@ const loadSessionChatWindowContent = (
   if (initialContactType) queryParams.set('initialContactType', initialContactType)
   const query = queryParams.toString()
   if (process.env.VITE_DEV_SERVER_URL) {
-    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-window?${query}`)
+    loadDevWindowURL(win, `${process.env.VITE_DEV_SERVER_URL}#/chat-window?${query}`)
     return
   }
   win.loadFile(join(__dirname, '../dist/index.html'), {
@@ -308,7 +403,7 @@ function createWindow(options: { autoShow?: boolean } = {}) {
 
   // 开发环境加载 vite 服务器
   if (process.env.VITE_DEV_SERVER_URL) {
-    win.loadURL(process.env.VITE_DEV_SERVER_URL)
+    loadDevWindowURL(win, process.env.VITE_DEV_SERVER_URL)
 
     // 开发环境下按 F12 或 Ctrl+Shift+I 打开开发者工具
     win.webContents.on('before-input-event', (event, input) => {
@@ -451,7 +546,7 @@ function createAgreementWindow() {
   })
 
   if (process.env.VITE_DEV_SERVER_URL) {
-    agreementWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/agreement-window`)
+    loadDevWindowURL(agreementWindow, `${process.env.VITE_DEV_SERVER_URL}#/agreement-window`)
   } else {
     agreementWindow.loadFile(join(__dirname, '../dist/index.html'), { hash: '/agreement-window' })
   }
@@ -495,7 +590,7 @@ function createSplashWindow(): BrowserWindow {
   })
 
   if (isDev) {
-    splashWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}splash.html`)
+    loadDevWindowURL(splashWindow, `${process.env.VITE_DEV_SERVER_URL}splash.html`)
   } else {
     splashWindow.loadFile(join(__dirname, '../dist/splash.html'))
   }
@@ -572,7 +667,7 @@ function createOnboardingWindow() {
   })
 
   if (process.env.VITE_DEV_SERVER_URL) {
-    onboardingWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/onboarding-window`)
+    loadDevWindowURL(onboardingWindow, `${process.env.VITE_DEV_SERVER_URL}#/onboarding-window`)
   } else {
     onboardingWindow.loadFile(join(__dirname, '../dist/index.html'), { hash: '/onboarding-window' })
   }
@@ -666,7 +761,7 @@ function createVideoPlayerWindow(videoPath: string, videoWidth?: number, videoHe
 
   const videoParam = `videoPath=${encodeURIComponent(videoPath)}`
   if (process.env.VITE_DEV_SERVER_URL) {
-    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/video-player-window?${videoParam}`)
+    loadDevWindowURL(win, `${process.env.VITE_DEV_SERVER_URL}#/video-player-window?${videoParam}`)
 
     win.webContents.on('before-input-event', (event, input) => {
       if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
@@ -724,7 +819,7 @@ function createImageViewerWindow(imagePath: string, liveVideoPath?: string) {
   if (liveVideoPath) imageParam += `&liveVideoPath=${encodeURIComponent(liveVideoPath)}`
 
   if (process.env.VITE_DEV_SERVER_URL) {
-    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/image-viewer-window?${imageParam}`)
+    loadDevWindowURL(win, `${process.env.VITE_DEV_SERVER_URL}#/image-viewer-window?${imageParam}`)
 
     win.webContents.on('before-input-event', (event, input) => {
       if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
@@ -783,7 +878,7 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
   })
 
   if (process.env.VITE_DEV_SERVER_URL) {
-    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-history/${sessionId}/${messageId}`)
+    loadDevWindowURL(win, `${process.env.VITE_DEV_SERVER_URL}#/chat-history/${sessionId}/${messageId}`)
 
     win.webContents.on('before-input-event', (event, input) => {
       if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
@@ -1333,7 +1428,11 @@ function registerIpcHandlers() {
     return wcdbService.testConnection(dbPath, hexKey, wxid)
   })
 
-  ipcMain.handle('wcdb:open', async (_, dbPath: string, hexKey: string, wxid: string) => {
+  ipcMain.handle('wcdb:open', async (_, dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) => {
+    // 新版 Weixin 4.x 多密钥模式：把 wcdbKeys 写入 wcdbService，供 fallback 解密使用
+    if (wcdbKeys && Object.keys(wcdbKeys).length > 0) {
+      wcdbService.setWcdbKeys(wcdbKeys)
+    }
     return wcdbService.open(dbPath, hexKey, wxid)
   })
 
@@ -2456,6 +2555,7 @@ function checkForUpdatesOnStartup() {
 }
 
 app.whenReady().then(async () => {
+  await waitForDevServerReady()
   // 立即创建 Splash 窗口，确保用户尽快看到反馈
   createSplashWindow()
 

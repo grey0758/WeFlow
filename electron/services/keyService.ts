@@ -5,10 +5,18 @@ import { execFile, spawn } from 'child_process'
 import { promisify } from 'util'
 import os from 'os'
 import crypto from 'crypto'
+import { pyWxDumpService } from './pyWxDumpService'
 
 const execFileAsync = promisify(execFile)
 
-type DbKeyResult = { success: boolean; key?: string; error?: string; logs?: string[] }
+type DbKeyResult = {
+  success: boolean
+  key?: string
+  wcdbKeys?: Record<string, string>  // 新版 Weixin 4.x: { salt_hex: key_hex }
+  error?: string
+  logs?: string[]
+  source?: 'dll' | 'pywxdump'        // 标记密钥来源，供 wcdbCore 选择解密路径
+}
 type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; error?: string }
 
 export class KeyService {
@@ -601,87 +609,46 @@ export class KeyService {
       onStatus?: (message: string, level: number) => void
   ): Promise<DbKeyResult> {
     if (!this.ensureWin32()) return { success: false, error: '仅支持 Windows' }
-    if (!this.ensureLoaded()) return { success: false, error: 'wx_key.dll 未加载' }
-    if (!this.ensureKernel32()) return { success: false, error: 'Kernel32 Init Failed' }
+    // 完全弃用 wx_key.dll，直接通过 PyWxDump 获取数据库密钥
+    onStatus?.('正在通过 PyWxDump 获取数据库密钥...', 0)
+    return this._getDbKeyViaPyWxDump(onStatus)
+  }
 
-    const logs: string[] = []
-
-    onStatus?.('正在查找微信进程...', 0)
-    const pid = await this.findWeChatPid()
-    if (!pid) {
-      const err = '未找到微信进程，请先启动微信'
-      onStatus?.(err, 2)
-      return { success: false, error: err }
+  /** 通过 PyWxDump 获取数据库密钥（DLL 失效时的替代方案） */
+  private async _getDbKeyViaPyWxDump(
+    onStatus?: (message: string, level: number) => void
+  ): Promise<DbKeyResult> {
+    const result = await pyWxDumpService.getDbKey(
+      (msg) => onStatus?.(msg, 0),
+      120_000
+    )
+    if (!result.success || !result.accounts?.length) {
+      return { success: false, error: result.error || 'PyWxDump 未返回任何账号信息' }
     }
 
-    onStatus?.(`检测到微信窗口 (PID: ${pid})，正在获取...`, 0)
-    onStatus?.('正在检测微信界面组件...', 0)
-    await this.waitForWeChatWindowComponents(pid, 15000)
+    const account = result.accounts[0]
 
-    const ok = this.initHook(pid)
-    if (!ok) {
-      const error = this.getLastErrorMsg ? this.decodeCString(this.getLastErrorMsg()) : ''
-      if (error) {
-        if (error.includes('0xC0000022') || error.includes('ACCESS_DENIED') || error.includes('打开目标进程失败')) {
-          const friendlyError = '权限不足：无法访问微信进程。\n\n解决方法：\n1. 右键 WeFlow 图标，选择"以管理员身份运行"\n2. 关闭可能拦截的安全软件（如360、火绒等）\n3. 确保微信没有以管理员权限运行'
-          return { success: false, error: friendlyError }
-        }
-        return { success: false, error }
-      }
-      const statusBuffer = Buffer.alloc(256)
-      const levelOut = [0]
-      const status = this.getStatusMessage && this.getStatusMessage(statusBuffer, statusBuffer.length, levelOut)
-          ? this.decodeUtf8(statusBuffer)
-          : ''
-      return { success: false, error: status || '初始化失败' }
-    }
-
-    const keyBuffer = Buffer.alloc(128)
-    const start = Date.now()
-    let loginRequiredDetected = false
-
-    try {
-      while (Date.now() - start < timeoutMs) {
-        if (this.pollKeyData(keyBuffer, keyBuffer.length)) {
-          const key = this.decodeUtf8(keyBuffer)
-          if (key.length === 64) {
-            onStatus?.('密钥获取成功', 1)
-            return { success: true, key, logs }
-          }
-        }
-
-        for (let i = 0; i < 5; i++) {
-          const statusBuffer = Buffer.alloc(256)
-          const levelOut = [0]
-          if (!this.getStatusMessage(statusBuffer, statusBuffer.length, levelOut)) break
-          const msg = this.decodeUtf8(statusBuffer)
-          const level = levelOut[0] ?? 0
-          if (msg) {
-            logs.push(msg)
-            if (this.isLoginRelatedText(msg)) {
-              loginRequiredDetected = true
-            }
-            onStatus?.(msg, level)
-          }
-        }
-        await new Promise((resolve) => setTimeout(resolve, 120))
-      }
-    } finally {
-      try {
-        this.cleanupHook()
-      } catch { }
-    }
-
-    const loginRequired = loginRequiredDetected || await this.detectWeChatLoginRequired(pid)
-    if (loginRequired) {
+    // 新版 Weixin 4.x：有 wcdb_keys（每个 DB 独立密钥）
+    if (account.wcdb_keys && Object.keys(account.wcdb_keys).length > 0) {
+      onStatus?.('检测到新版 Weixin 4.x，使用多密钥模式', 1)
       return {
-        success: false,
-        error: '微信已启动但尚未完成登录，请先在微信客户端完成登录后再重试自动获取密钥。',
-        logs
+        success: true,
+        wcdbKeys: account.wcdb_keys,
+        source: 'pywxdump',
       }
     }
 
-    return { success: false, error: '获取密钥超时', logs }
+    // 旧版 WeChat 3.x：单一 64位 hex key
+    if (account.key && account.key.length === 64) {
+      onStatus?.('密钥获取成功（PyWxDump）', 1)
+      return {
+        success: true,
+        key: account.key,
+        source: 'pywxdump',
+      }
+    }
+
+    return { success: false, error: 'PyWxDump 返回的密钥格式无效' }
   }
 
   // --- Image Key (通过 DLL 从缓存目录获取 code，用前端 wxid 计算密钥) ---

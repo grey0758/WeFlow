@@ -31,6 +31,10 @@ if (parentPort) {
                     result = { success: monitorOk }
                     break
                     }
+                case 'setWcdbKeys':
+                    core.setWcdbKeys(payload.wcdbKeys)
+                    result = { success: true }
+                    break
                 case 'testConnection':
                     result = await core.testConnection(payload.dbPath, payload.hexKey, payload.wxid)
                     break
