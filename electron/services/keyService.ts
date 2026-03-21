@@ -626,7 +626,11 @@ export class KeyService {
       return { success: false, error: result.error || 'PyWxDump 未返回任何账号信息' }
     }
 
-    const account = result.accounts[0]
+    // 优先找有 wcdb_keys 或 key 的账号，而非固定取第一个（同一 wxid 可能有多个进程）
+    const account = result.accounts.find((a: any) =>
+      (a.wcdb_keys && Object.keys(a.wcdb_keys).length > 0) ||
+      (a.key && a.key.length === 64)
+    ) ?? result.accounts[0]
 
     // 新版 Weixin 4.x：有 wcdb_keys（每个 DB 独立密钥）
     if (account.wcdb_keys && Object.keys(account.wcdb_keys).length > 0) {

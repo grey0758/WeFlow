@@ -102,15 +102,16 @@ class DualReportService {
 
   private async ensureConnectedWithConfig(
     dbPath: string,
-    decryptKey: string,
+    wcdbKeys: Record<string, string>,
     wxid: string
   ): Promise<{ success: boolean; cleanedWxid?: string; rawWxid?: string; error?: string }> {
     if (!wxid) return { success: false, error: '未配置微信ID' }
     if (!dbPath) return { success: false, error: '未配置数据库路径' }
-    if (!decryptKey) return { success: false, error: '未配置解密密钥' }
+    if (!(wcdbKeys && Object.keys(wcdbKeys).length > 0)) return { success: false, error: '未配置解密密钥' }
 
     const cleanedWxid = this.cleanAccountDirName(wxid)
-    const ok = await wcdbService.open(dbPath, decryptKey, cleanedWxid)
+    wcdbService.setWcdbKeys(wcdbKeys)
+    const ok = await wcdbService.open(dbPath, '', cleanedWxid)
     if (!ok) return { success: false, error: 'WCDB 打开失败' }
     return { success: true, cleanedWxid, rawWxid: wxid }
   }
@@ -500,15 +501,15 @@ class DualReportService {
     year: number
     friendUsername: string
     dbPath: string
-    decryptKey: string
+    wcdbKeys: Record<string, string>
     wxid: string
     excludeWords?: string[]
     onProgress?: (status: string, progress: number) => void
   }): Promise<{ success: boolean; data?: DualReportData; error?: string }> {
     try {
-      const { year, friendUsername, dbPath, decryptKey, wxid, excludeWords, onProgress } = params
+      const { year, friendUsername, dbPath, wcdbKeys, wxid, excludeWords, onProgress } = params
       this.reportProgress('正在连接数据库...', 5, onProgress)
-      const conn = await this.ensureConnectedWithConfig(dbPath, decryptKey, wxid)
+      const conn = await this.ensureConnectedWithConfig(dbPath, wcdbKeys, wxid)
       if (!conn.success || !conn.cleanedWxid || !conn.rawWxid) return { success: false, error: conn.error }
 
       const cleanedWxid = conn.cleanedWxid

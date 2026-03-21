@@ -128,13 +128,13 @@ export interface ElectronAPI {
     getDefault: () => Promise<string>
   }
   wcdb: {
-    testConnection: (dbPath: string, hexKey: string, wxid: string) => Promise<{ success: boolean; error?: string; sessionCount?: number }>
-    open: (dbPath: string, hexKey: string, wxid: string) => Promise<boolean>
+    testConnection: (dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) => Promise<{ success: boolean; error?: string; sessionCount?: number }>
+    open: (dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) => Promise<boolean>
     close: () => Promise<boolean>
 
   }
   key: {
-    autoGetDbKey: () => Promise<{ success: boolean; key?: string; error?: string; logs?: string[] }>
+    autoGetDbKey: () => Promise<{ success: boolean; key?: string; wcdbKeys?: Record<string, string>; error?: string; logs?: string[] }>
     autoGetImageKey: (manualDir?: string, wxid?: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; error?: string }>
     scanImageKeyFromMemory: (userDir: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; error?: string }>
     onDbKeyStatus: (callback: (payload: { message: string; level: number }) => void) => () => void

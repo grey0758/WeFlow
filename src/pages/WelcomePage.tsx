@@ -43,6 +43,7 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
   const [stepIndex, setStepIndex] = useState(0)
   const [dbPath, setDbPath] = useState('')
   const [decryptKey, setDecryptKey] = useState('')
+  const [wcdbKeys, setWcdbKeys] = useState<Record<string, string> | null>(null)
   const [imageXorKey, setImageXorKey] = useState('')
   const [imageAesKey, setImageAesKey] = useState('')
   const [cachePath, setCachePath] = useState('')
@@ -335,7 +336,14 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
       const result = await window.electronAPI.key.autoGetDbKey()
       if (result.success && result.key) {
         setDecryptKey(result.key)
+        setWcdbKeys(null)
         setDbKeyStatus('密钥获取成功')
+        setError('')
+        await handleScanWxid(true)
+      } else if (result.success && result.wcdbKeys && Object.keys(result.wcdbKeys).length > 0) {
+        setWcdbKeys(result.wcdbKeys)
+        setDecryptKey('')
+        setDbKeyStatus(`密钥获取成功（多密钥模式，共 ${Object.keys(result.wcdbKeys).length} 个）`)
         setError('')
         await handleScanWxid(true)
       } else {
@@ -413,7 +421,7 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
     if (currentStep.id === 'intro') return true
     if (currentStep.id === 'db') return Boolean(dbPath)
     if (currentStep.id === 'cache') return true
-    if (currentStep.id === 'key') return decryptKey.length === 64 && Boolean(wxid)
+    if (currentStep.id === 'key') return (decryptKey.length === 64 || wcdbKeys !== null) && Boolean(wxid)
     if (currentStep.id === 'image') return true
     if (currentStep.id === 'security') {
       if (enableAuth) {
@@ -428,7 +436,7 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
     if (!canGoNext()) {
       if (currentStep.id === 'db' && !dbPath) setError('请先选择数据库目录')
       if (currentStep.id === 'key') {
-        if (decryptKey.length !== 64) setError('密钥长度必须为 64 个字符')
+        if (decryptKey.length !== 64 && !wcdbKeys) setError('密钥长度必须为 64 个字符')
         else if (!wxid) setError('未能自动识别 wxid，请尝试重新获取或检查目录')
       }
       return
@@ -445,14 +453,16 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
   const handleConnect = async () => {
     if (!dbPath) { setError('请先选择数据库目录'); return }
     if (!wxid) { setError('请填写微信ID'); return }
-    if (!decryptKey || decryptKey.length !== 64) { setError('请填写 64 位解密密钥'); return }
+    if (!decryptKey && !wcdbKeys) { setError('请先使用自动获取密钥获取解密密钥'); return }
 
     setIsConnecting(true)
     setError('')
     setLoading(true, '正在连接数据库...')
 
     try {
-      const result = await window.electronAPI.wcdb.testConnection(dbPath, decryptKey, wxid)
+      const result = await window.electronAPI.wcdb.testConnection(
+        dbPath, decryptKey || '', wxid, wcdbKeys ?? undefined
+      )
       if (!result.success) {
         setError(result.error || 'WCDB 连接失败')
         setLoading(false)
@@ -460,14 +470,15 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
       }
 
       await configService.setDbPath(dbPath)
-      await configService.setDecryptKey(decryptKey)
+      if (decryptKey) await configService.setDecryptKey(decryptKey)
+      if (wcdbKeys) await configService.setWcdbKeys(wcdbKeys)
       await configService.setMyWxid(wxid)
       await configService.setCachePath(cachePath)
       const parsedXorKey = imageXorKey ? parseInt(imageXorKey.replace(/^0x/i, ''), 16) : null
       await configService.setImageXorKey(typeof parsedXorKey === 'number' && !Number.isNaN(parsedXorKey) ? parsedXorKey : 0)
       await configService.setImageAesKey(imageAesKey || '')
       await configService.setWxidConfig(wxid, {
-        decryptKey,
+        decryptKey: decryptKey || undefined,
         imageXorKey: typeof parsedXorKey === 'number' && !Number.isNaN(parsedXorKey) ? parsedXorKey : 0,
         imageAesKey
       })

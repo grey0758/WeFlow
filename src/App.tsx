@@ -358,14 +358,17 @@ function App() {
         const wxid = await configService.getMyWxid()
         const onboardingDone = await configService.getOnboardingDone()
         const wxidConfig = wxid ? await configService.getWxidConfig(wxid) : null
+        const wcdbKeys = await configService.getWcdbKeys()
         const effectiveDecryptKey = wxidConfig?.decryptKey || decryptKey
 
         if (wxidConfig?.decryptKey && wxidConfig.decryptKey !== decryptKey) {
           await configService.setDecryptKey(wxidConfig.decryptKey)
         }
 
+        const hasKeys = Boolean(effectiveDecryptKey) || Boolean(wcdbKeys && Object.keys(wcdbKeys).length > 0)
+
         // 如果配置完整，自动测试连接
-        if (dbPath && effectiveDecryptKey && wxid) {
+        if (dbPath && hasKeys && wxid) {
           if (!onboardingDone) {
             await configService.setOnboardingDone(true)
           }

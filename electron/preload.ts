@@ -135,10 +135,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // WCDB 数据库
   wcdb: {
-    testConnection: (dbPath: string, hexKey: string, wxid: string) =>
-      ipcRenderer.invoke('wcdb:testConnection', dbPath, hexKey, wxid),
-    open: (dbPath: string, hexKey: string, wxid: string) =>
-      ipcRenderer.invoke('wcdb:open', dbPath, hexKey, wxid),
+    testConnection: (dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) =>
+      ipcRenderer.invoke('wcdb:testConnection', dbPath, hexKey, wxid, wcdbKeys),
+    open: (dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) =>
+      ipcRenderer.invoke('wcdb:open', dbPath, hexKey, wxid, wcdbKeys),
     close: () => ipcRenderer.invoke('wcdb:close'),
 
   },

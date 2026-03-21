@@ -1003,6 +1003,11 @@ export class WcdbCore {
         return { success: false, error: `未找到 session.db 文件` }
       }
 
+      // fallback 模式下无法调用 DLL，直接验证文件存在即可
+      if (this.fallbackMode) {
+        return { success: true, sessionCount: 0 }
+      }
+
       // 分配输出参数内存
       const handleOut = [0]
       const result = this.wcdbOpenAccount(sessionDbPath, hexKey, handleOut)
@@ -1288,16 +1293,71 @@ export class WcdbCore {
       // 关闭旧的 better-sqlite3 连接
       this.closeFallbackDbs()
 
+      // 解密输出目录（先计算，以便提前检测是否已有解密文件）
+      const outDir = pyWxDumpService.makeDecryptedDir(wxid || 'unknown')
+
+      // 已有解密文件时跳过原始DB检查和重新解密，直接复用
+      const hasExistingDecrypted = (() => {
+        try {
+          if (!existsSync(outDir)) return false
+          const walk = (dir: string): boolean => {
+            for (const entry of readdirSync(dir, { withFileTypes: true })) {
+              if (entry.isDirectory()) { if (walk(join(dir, entry.name))) return true; continue }
+              if (entry.isFile() && entry.name.startsWith('de_') && entry.name.endsWith('.db')) return true
+            }
+            return false
+          }
+          return walk(outDir)
+        } catch { return false }
+      })()
+
+      if (hasExistingDecrypted) {
+        // Check if source DB files are newer than decrypted files → re-decrypt if stale
+        const dbStoragePath2 = this.resolveDbStoragePath(dbPath, wxid)
+        let needRedo = false
+        if (dbStoragePath2 && existsSync(dbStoragePath2)) {
+          try {
+            const getNewestMtime = (dir: string): number => {
+              let newest = 0
+              const walk = (d: string) => {
+                for (const e of readdirSync(d, { withFileTypes: true })) {
+                  const full = join(d, e.name)
+                  if (e.isDirectory()) { walk(full); continue }
+                  try { const m = statSync(full).mtimeMs; if (m > newest) newest = m } catch {}
+                }
+              }
+              walk(dir)
+              return newest
+            }
+            const srcMtime = getNewestMtime(dbStoragePath2)
+            const decMtime = getNewestMtime(outDir)
+            if (srcMtime > decMtime) {
+              this.writeLog(`openFallback: 源DB已更新(${new Date(srcMtime).toISOString()})，重新解密`, true)
+              needRedo = true
+            }
+          } catch {}
+        }
+        if (!needRedo) {
+          this.writeLog('openFallback: 已有解密文件且未过期，直接复用', true)
+          this.currentPath = dbPath
+          this.currentKey = hexKey
+          this.currentWxid = wxid
+          this.currentDbStoragePath = null
+          this.fallbackDecryptedDir = outDir
+          return true
+        }
+        this.closeFallbackDbs()
+      }
+
+      // 没有解密文件时，需要原始DB目录
       const dbStoragePath = this.resolveDbStoragePath(dbPath, wxid)
       this.writeLog(`openFallback dbPath=${dbPath} wxid=${wxid} dbStorage=${dbStoragePath || 'null'}`, true)
 
       if (!dbStoragePath || !existsSync(dbStoragePath)) {
-        this.writeLog(`openFallback failed: dbStorage not found`, true)
+        this.writeLog(`openFallback failed: dbStorage not found and no existing decrypted files`, true)
         return false
       }
 
-      // 解密输出目录
-      const outDir = pyWxDumpService.makeDecryptedDir(wxid || 'unknown')
       this.writeLog(`openFallback decrypting to ${outDir}`, true)
 
       // hexKey 可能是单 key（旧版）或者 wcdbKeys JSON（新版）
@@ -1314,6 +1374,15 @@ export class WcdbCore {
 
       if (!result.success) {
         this.writeLog(`openFallback decrypt failed: ${result.error}`, true)
+        if (hasExistingDecrypted) {
+          this.writeLog(`openFallback: 解密失败但已有解密文件，尝试复用`, true)
+          this.currentPath = dbPath
+          this.currentKey = hexKey
+          this.currentWxid = wxid
+          this.currentDbStoragePath = null
+          this.fallbackDecryptedDir = outDir
+          return true
+        }
         return false
       }
 
@@ -1347,6 +1416,10 @@ export class WcdbCore {
 
     // 优先按 pathHint（绝对路径或相对路径）查找
     if (pathHint) {
+      // 如果 pathHint 是存在的绝对路径（如 hardlink.db），直接打开，不加 de_ 前缀
+      if (existsSync(pathHint)) {
+        return this.openFallbackDb(pathHint)
+      }
       const hintName = pathHint.replace(/\\/g, '/').split('/').pop() || ''
       const deName = hintName.startsWith('de_') ? hintName : `de_${hintName}`
       const found = this.findDecryptedFile(deName)
@@ -1365,21 +1438,29 @@ export class WcdbCore {
     const candidates = kind ? (kindMap[kind.toLowerCase()] ?? []) : []
     for (const name of candidates) {
       const found = this.findDecryptedFile(name)
-      if (found) return this.openFallbackDb(found)
+      if (found) {
+        const db = this.openFallbackDb(found)
+        if (db) return db
+      }
     }
 
-    // 兜底：返回第一个找到的 .db 文件
+    // 兜底：遍历所有 de_*.db 文件，返回第一个能成功打开的
     try {
-      const walk = (dir: string): string | null => {
-        for (const entry of readdirSync(dir, { withFileTypes: true })) {
-          const full = join(dir, entry.name)
-          if (entry.isDirectory()) { const f = walk(full); if (f) return f }
-          else if (entry.isFile() && entry.name.startsWith('de_') && entry.name.endsWith('.db')) return full
-        }
-        return null
+      const allFiles: string[] = []
+      const walk = (dir: string) => {
+        try {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name)
+            if (entry.isDirectory()) { walk(full); continue }
+            if (entry.isFile() && entry.name.startsWith('de_') && entry.name.endsWith('.db')) allFiles.push(full)
+          }
+        } catch {}
       }
-      const fallback = walk(this.fallbackDecryptedDir)
-      if (fallback) return this.openFallbackDb(fallback)
+      walk(this.fallbackDecryptedDir!)
+      for (const f of allFiles) {
+        const db = this.openFallbackDb(f)
+        if (db) return db
+      }
     } catch {}
 
     return null
@@ -1468,24 +1549,66 @@ export class WcdbCore {
             if (!db) continue
 
             try {
-              // 检查是否有 message 表且包含该 session
-              const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
-              const tableName = tables.find((t: any) => {
-                // Chat_<sessionId_encoded> 形式
-                return t.name.includes(sessionId.replace('@', '_').replace('.', '_'))
-              })?.name
+              // Weixin 4.x: Msg_<md5(sessionId)> tables
+              const md5Hash = require('crypto').createHash('md5').update(sessionId).digest('hex')
+              const wx4TableName = `Msg_${md5Hash}`
+              const wx4Tables: any[] = db.prepare(
+                `SELECT name FROM sqlite_master WHERE type='table' AND name=?`
+              ).all(wx4TableName)
 
+              // Weixin 3.x fallback: Chat_<sessionId_encoded> tables
+              const wx3Tables: any[] = wx4Tables.length === 0
+                ? db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+                : []
+              const wx3TableName = wx3Tables.find((t: any) =>
+                t.name.includes(sessionId.replace('@', '_').replace('.', '_'))
+              )?.name
+
+              const tableName = wx4Tables.length > 0 ? wx4TableName : wx3TableName
               if (!tableName) continue
 
+              // Weixin 4.x uses create_time; Weixin 3.x uses CreateTime
+              const isWx4 = wx4Tables.length > 0
+              const timeCol = isWx4 ? 'create_time' : 'CreateTime'
               let whereClauses = ''
               const params: any[] = []
-              if (beginTimestamp > 0) { whereClauses += ` AND CreateTime >= ?`; params.push(beginTimestamp) }
-              if (endTimestamp > 0)   { whereClauses += ` AND CreateTime <= ?`; params.push(endTimestamp) }
+              if (beginTimestamp > 0) { whereClauses += ` AND ${timeCol} >= ?`; params.push(beginTimestamp) }
+              if (endTimestamp > 0)   { whereClauses += ` AND ${timeCol} <= ?`; params.push(endTimestamp) }
+
+              // Weixin 4.x: build real_sender_id → username map from this DB's Name2Id table
+              const senderMap: Record<number, string> = {}
+              if (isWx4) {
+                try {
+                  const name2idRows: any[] = db.prepare(`SELECT rowid, user_name FROM Name2Id`).all()
+                  for (const n of name2idRows) {
+                    if (n.user_name) senderMap[n.rowid] = n.user_name
+                  }
+                } catch {}
+              }
 
               const order = ascending ? 'ASC' : 'DESC'
               const rows: any[] = db.prepare(
-                `SELECT * FROM "${tableName}" WHERE 1=1${whereClauses} ORDER BY CreateTime ${order}`
+                `SELECT * FROM "${tableName}" WHERE 1=1${whereClauses} ORDER BY ${timeCol} ${order}`
               ).all(...params)
+
+              // Inject sender_username so mapRowsToMessages can determine isSend
+              // In Weixin 4.x, real_sender_id=0 means "sent by me" (self)
+              if (isWx4) {
+                for (const row of rows) {
+                  const sid = row.real_sender_id
+                  if (!sid && sid !== undefined) {
+                    // real_sender_id is 0/null/undefined → self-sent message
+                    row.computed_is_send = 1
+                  } else if (sid) {
+                    if (senderMap[sid]) {
+                      row.sender_username = senderMap[sid]
+                    }
+                    // Non-zero real_sender_id always means "received", even if not in Name2Id
+                    row.computed_is_send = 0
+                  }
+                }
+              }
+
               allRows.push(...rows)
             } catch {}
           }
@@ -1512,10 +1635,22 @@ export class WcdbCore {
     try {
       const decryptedDir = this.fallbackDecryptedDir
       if (!decryptedDir) return { success: false, error: 'fallback 未初始化' }
-      const sessionStats: Record<string, { count: number; minTime: number; maxTime: number }> = {}
+
+      // sessions: { [sessionId]: { sent, received, total, monthly, lastTime } }
+      const sessionsMap: Record<string, { sent: number; received: number; total: number; monthly: Record<string, number>; lastTime: number }> = {}
       for (const sid of sessionIds) {
-        sessionStats[sid] = { count: 0, minTime: 0, maxTime: 0 }
+        sessionsMap[sid] = { sent: 0, received: 0, total: 0, monthly: {}, lastTime: 0 }
       }
+      // daily: { [YYYY-MM-DD]: count }
+      const dailyMap: Record<string, number> = {}
+      // hourly: { [0-23]: count }
+      const hourlyMap: Record<number, number> = {}
+      // typeCounts: { [local_type]: count }
+      const typeCountsMap: Record<number, number> = {}
+      // firstTime / lastTime across all sessions
+      let firstTime = 0
+      let lastTime = 0
+
       const walk = (dir: string) => {
         try {
           for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -1525,20 +1660,240 @@ export class WcdbCore {
             const db = this.openFallbackDb(full)
             if (!db) continue
             try {
+              // Weixin 4.x: Msg_<md5(sessionId)> with create_time, real_sender_id, local_type
+              for (const sid of sessionIds) {
+                const md5Hash = require('crypto').createHash('md5').update(sid).digest('hex')
+                const wx4Name = `Msg_${md5Hash}`
+                const wx4Exists: any[] = db.prepare(
+                  `SELECT name FROM sqlite_master WHERE type='table' AND name=?`
+                ).all(wx4Name)
+                if (wx4Exists.length === 0) continue
+
+                let where = 'WHERE create_time > 0'
+                if (begin > 0) where += ` AND create_time >= ${begin}`
+                if (end > 0) where += ` AND create_time <= ${end}`
+
+                // Monthly + sent/received breakdown
+                const monthRows: any[] = db.prepare(
+                  `SELECT CAST(strftime('%m', create_time, 'unixepoch') AS INTEGER) AS month,
+                          SUM(CASE WHEN real_sender_id IS NULL OR real_sender_id = 0 THEN 1 ELSE 0 END) AS sent_cnt,
+                          SUM(CASE WHEN real_sender_id IS NOT NULL AND real_sender_id != 0 THEN 1 ELSE 0 END) AS recv_cnt
+                   FROM "${wx4Name}" ${where} GROUP BY month`
+                ).all()
+                for (const r of monthRows) {
+                  sessionsMap[sid].sent += r.sent_cnt ?? 0
+                  sessionsMap[sid].received += r.recv_cnt ?? 0
+                  if (r.month) {
+                    const m = String(r.month)
+                    sessionsMap[sid].monthly[m] = (sessionsMap[sid].monthly[m] || 0) + (r.sent_cnt ?? 0) + (r.recv_cnt ?? 0)
+                  }
+                }
+
+                // Daily + hourly breakdown
+                const dayHourRows: any[] = db.prepare(
+                  `SELECT strftime('%Y-%m-%d', create_time, 'unixepoch') AS day,
+                          CAST(strftime('%H', create_time, 'unixepoch') AS INTEGER) AS hour,
+                          COUNT(1) AS cnt
+                   FROM "${wx4Name}" ${where} GROUP BY day, hour`
+                ).all()
+                for (const r of dayHourRows) {
+                  if (r.day) dailyMap[r.day] = (dailyMap[r.day] || 0) + (r.cnt ?? 0)
+                  if (r.hour !== null && r.hour !== undefined) hourlyMap[r.hour] = (hourlyMap[r.hour] || 0) + (r.cnt ?? 0)
+                }
+
+                // Type counts
+                const typeRows: any[] = db.prepare(
+                  `SELECT local_type, COUNT(1) AS cnt FROM "${wx4Name}" ${where} GROUP BY local_type`
+                ).all()
+                for (const r of typeRows) {
+                  const t = r.local_type ?? 0
+                  typeCountsMap[t] = (typeCountsMap[t] || 0) + (r.cnt ?? 0)
+                }
+
+                // First / last time
+                const rangeRow: any = db.prepare(
+                  `SELECT MIN(create_time) AS ft, MAX(create_time) AS lt FROM "${wx4Name}" ${where}`
+                ).get()
+                if (rangeRow) {
+                  if (rangeRow.ft && (firstTime === 0 || rangeRow.ft < firstTime)) firstTime = rangeRow.ft
+                  if (rangeRow.lt && rangeRow.lt > lastTime) {
+                    lastTime = rangeRow.lt
+                    sessionsMap[sid].lastTime = Math.max(sessionsMap[sid].lastTime, rangeRow.lt)
+                  }
+                }
+              }
+
+              // Weixin 3.x: Chat_<encoded> with CreateTime, IsSend, Type
               const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
               for (const t of tables) {
                 const matchSid = sessionIds.find(sid => t.name.includes(sid.replace('@', '_').replace('.', '_')))
                 if (!matchSid) continue
-                let where = 'WHERE 1=1'
+                let where = 'WHERE CreateTime > 0'
                 if (begin > 0) where += ` AND CreateTime >= ${begin}`
                 if (end > 0) where += ` AND CreateTime <= ${end}`
-                const stat: any = db.prepare(`SELECT COUNT(1) AS cnt, MIN(CreateTime) AS minT, MAX(CreateTime) AS maxT FROM "${t.name}" ${where}`).get()
-                if (stat) {
-                  sessionStats[matchSid].count += stat.cnt ?? 0
-                  if (stat.minT && (!sessionStats[matchSid].minTime || stat.minT < sessionStats[matchSid].minTime))
-                    sessionStats[matchSid].minTime = stat.minT
-                  if (stat.maxT && stat.maxT > sessionStats[matchSid].maxTime)
-                    sessionStats[matchSid].maxTime = stat.maxT
+
+                const monthRows: any[] = db.prepare(
+                  `SELECT CAST(strftime('%m', CreateTime, 'unixepoch') AS INTEGER) AS month,
+                          SUM(CASE WHEN IsSend=1 THEN 1 ELSE 0 END) AS sent_cnt,
+                          SUM(CASE WHEN IsSend=0 THEN 1 ELSE 0 END) AS recv_cnt
+                   FROM "${t.name}" ${where} GROUP BY month`
+                ).all()
+                for (const r of monthRows) {
+                  sessionsMap[matchSid].sent += r.sent_cnt ?? 0
+                  sessionsMap[matchSid].received += r.recv_cnt ?? 0
+                  if (r.month) {
+                    const m = String(r.month)
+                    sessionsMap[matchSid].monthly[m] = (sessionsMap[matchSid].monthly[m] || 0) + (r.sent_cnt ?? 0) + (r.recv_cnt ?? 0)
+                  }
+                }
+
+                const dayHourRows3: any[] = db.prepare(
+                  `SELECT strftime('%Y-%m-%d', CreateTime, 'unixepoch') AS day,
+                          CAST(strftime('%H', CreateTime, 'unixepoch') AS INTEGER) AS hour,
+                          COUNT(1) AS cnt
+                   FROM "${t.name}" ${where} GROUP BY day, hour`
+                ).all()
+                for (const r of dayHourRows3) {
+                  if (r.day) dailyMap[r.day] = (dailyMap[r.day] || 0) + (r.cnt ?? 0)
+                  if (r.hour !== null && r.hour !== undefined) hourlyMap[r.hour] = (hourlyMap[r.hour] || 0) + (r.cnt ?? 0)
+                }
+
+                // Type counts (3.x uses "Type" column)
+                try {
+                  const typeRows3: any[] = db.prepare(
+                    `SELECT Type AS local_type, COUNT(1) AS cnt FROM "${t.name}" ${where} GROUP BY Type`
+                  ).all()
+                  for (const r of typeRows3) {
+                    const tp = r.local_type ?? 0
+                    typeCountsMap[tp] = (typeCountsMap[tp] || 0) + (r.cnt ?? 0)
+                  }
+                } catch {}
+
+                // First / last time (3.x)
+                try {
+                  const rangeRow3: any = db.prepare(
+                    `SELECT MIN(CreateTime) AS ft, MAX(CreateTime) AS lt FROM "${t.name}" ${where}`
+                  ).get()
+                  if (rangeRow3) {
+                    if (rangeRow3.ft && (firstTime === 0 || rangeRow3.ft < firstTime)) firstTime = rangeRow3.ft
+                    if (rangeRow3.lt && rangeRow3.lt > lastTime) {
+                      lastTime = rangeRow3.lt
+                      sessionsMap[matchSid].lastTime = Math.max(sessionsMap[matchSid].lastTime, rangeRow3.lt)
+                    }
+                  }
+                } catch {}
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+      walk(decryptedDir)
+
+      // Compute top-level totals
+      let total = 0
+      let topSent = 0
+      let topReceived = 0
+      const topMonthly: Record<string, number> = {}
+      for (const s of Object.values(sessionsMap)) {
+        s.total = s.sent + s.received
+        total += s.total
+        topSent += s.sent
+        topReceived += s.received
+        for (const [m, c] of Object.entries(s.monthly)) {
+          topMonthly[m] = (topMonthly[m] || 0) + c
+        }
+      }
+
+      // Compute weekday distribution from dailyMap keys
+      const weekdayMap: Record<number, number> = {}
+      for (const dayKey of Object.keys(dailyMap)) {
+        const d = new Date(dayKey + 'T12:00:00Z')
+        const w = d.getUTCDay() // 0=Sunday
+        weekdayMap[w] = (weekdayMap[w] || 0) + (dailyMap[dayKey] || 0)
+      }
+
+      return {
+        success: true,
+        data: {
+          total,
+          sent: topSent,
+          received: topReceived,
+          firstTime,
+          lastTime,
+          sessions: sessionsMap,
+          daily: dailyMap,
+          hourly: hourlyMap,
+          weekday: weekdayMap,
+          monthly: topMonthly,
+          typeCounts: typeCountsMap,
+          begin,
+          end,
+        }
+      }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /**
+   * fallback 模式下的群聊统计：按发言人统计消息数
+   */
+  private async _getGroupStatsFallback(
+    chatroomId: string,
+    begin: number,
+    end: number
+  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const decryptedDir = this.fallbackDecryptedDir
+      if (!decryptedDir) return { success: false, error: 'fallback 未初始化' }
+
+      const sendersMap: Record<string, number> = {}
+      const hourlyMap: Record<number, number> = {}
+      const idMap: Record<string, string> = {}
+
+      const md5Hash = require('crypto').createHash('md5').update(chatroomId).digest('hex')
+      const wx4Name = `Msg_${md5Hash}`
+
+      let where = 'WHERE create_time > 0'
+      if (begin > 0) where += ` AND create_time >= ${begin}`
+      if (end > 0) where += ` AND create_time <= ${end}`
+
+      const walk = (dir: string) => {
+        try {
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name)
+            if (entry.isDirectory()) { walk(full); continue }
+            if (!entry.isFile() || !entry.name.startsWith('de_') || !entry.name.endsWith('.db')) continue
+            const db = this.openFallbackDb(full)
+            if (!db) continue
+            try {
+              const wx4Exists: any[] = db.prepare(
+                `SELECT name FROM sqlite_master WHERE type='table' AND name=?`
+              ).all(wx4Name)
+              if (wx4Exists.length === 0) continue
+
+              // Build Name2Id map from this DB
+              try {
+                const name2idRows: any[] = db.prepare(`SELECT rowid, user_name FROM Name2Id`).all()
+                for (const n of name2idRows) {
+                  if (n.user_name) idMap[String(n.rowid)] = n.user_name
+                }
+              } catch {}
+
+              // Per-sender + hourly counts
+              const senderRows: any[] = db.prepare(
+                `SELECT real_sender_id,
+                        CAST(strftime('%H', create_time, 'unixepoch') AS INTEGER) AS hour,
+                        COUNT(1) AS cnt
+                 FROM "${wx4Name}" ${where} GROUP BY real_sender_id, hour`
+              ).all()
+              for (const r of senderRows) {
+                const username = (r.real_sender_id === 0 || r.real_sender_id === null)
+                  ? '_self_'
+                  : (idMap[String(r.real_sender_id)] || String(r.real_sender_id))
+                sendersMap[username] = (sendersMap[username] || 0) + (r.cnt ?? 0)
+                if (r.hour !== null && r.hour !== undefined) {
+                  hourlyMap[r.hour] = (hourlyMap[r.hour] || 0) + (r.cnt ?? 0)
                 }
               }
             } catch {}
@@ -1546,14 +1901,17 @@ export class WcdbCore {
         } catch {}
       }
       walk(decryptedDir)
-      const total = Object.values(sessionStats).reduce((s, v) => s + v.count, 0)
+
+      let total = 0
+      for (const c of Object.values(sendersMap)) total += c
+
       return {
         success: true,
         data: {
           total,
-          sessions: Object.entries(sessionStats).map(([sessionId, s]) => ({ sessionId, ...s })),
-          begin,
-          end,
+          sessions: { [chatroomId]: { senders: sendersMap } },
+          idMap,
+          hourly: hourlyMap,
         }
       }
     } catch (e) {
@@ -1612,10 +1970,46 @@ export class WcdbCore {
     try {
       // fallback 模式
       if (this.fallbackMode) {
-        const r = this.execQueryFallback('session', null,
-          `SELECT * FROM SessionAbstract ORDER BY nOrder DESC`)
-        if (!r.success) return { success: false, error: r.error }
-        return { success: true, sessions: r.rows ?? [] }
+        const decryptedDir = this.fallbackDecryptedDir
+        if (!decryptedDir) return { success: false, error: 'fallback 未初始化' }
+
+        // Walk all de_*.db files, try SessionTable (4.x) then SessionAbstract (3.x)
+        const allFiles: string[] = []
+        const walkDir = (dir: string) => {
+          try {
+            for (const entry of readdirSync(dir, { withFileTypes: true })) {
+              const full = join(dir, entry.name)
+              if (entry.isDirectory()) { walkDir(full); continue }
+              if (entry.isFile() && entry.name.startsWith('de_') && entry.name.endsWith('.db')) allFiles.push(full)
+            }
+          } catch {}
+        }
+        walkDir(decryptedDir)
+
+        for (const filePath of allFiles) {
+          const db = this.openFallbackDb(filePath)
+          if (!db) continue
+          try {
+            const tables: any[] = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name IN ('SessionTable','SessionAbstract')`).all()
+            const hasWx4 = tables.some((t: any) => t.name === 'SessionTable')
+            const hasWx3 = tables.some((t: any) => t.name === 'SessionAbstract')
+            if (hasWx4) {
+              const rows = db.prepare(`SELECT * FROM SessionTable ORDER BY sort_timestamp DESC`).all()
+              if (rows.length > 0) {
+                this.writeLog(`[wx4] SessionTable columns: ${Object.keys(rows[0]).join(', ')}`, true)
+                this.writeLog(`[wx4] SessionTable first row sample: ${JSON.stringify(rows[0]).slice(0, 300)}`, true)
+              } else {
+                this.writeLog(`[wx4] SessionTable is empty`, true)
+              }
+              return { success: true, sessions: rows }
+            }
+            if (hasWx3) {
+              const rows = db.prepare(`SELECT * FROM SessionAbstract ORDER BY nOrder DESC`).all()
+              return { success: true, sessions: rows }
+            }
+          } catch {}
+        }
+        return { success: true, sessions: [] }
       }
 
       // 使用 setImmediate 让事件循环有机会处理其他任务，避免长时间阻塞
@@ -1787,6 +2181,7 @@ export class WcdbCore {
         // 同时支持旧版（username 列）和新版 Weixin 4.x（UserName 列）
         const sqlCandidates = [
           `SELECT UserName, NickName, Remark FROM Contact WHERE UserName IN (${inList})`,
+          `SELECT username, nick_name, remark FROM contact WHERE username IN (${inList})`,
           `SELECT username, nickName, remark FROM contact WHERE username IN (${inList})`,
           `SELECT usrName, nickName, remark FROM contact WHERE usrName IN (${inList})`,
         ]
@@ -1801,7 +2196,7 @@ export class WcdbCore {
           if (!uname) continue
           const display = this.pickFirstStringField(row, [
             'Remark', 'remark',
-            'NickName', 'nickName', 'nickname',
+            'NickName', 'nickName', 'nickname', 'nick_name',
             'Alias', 'alias'
           ]) || uname
           map[uname] = display
@@ -1957,6 +2352,9 @@ export class WcdbCore {
     if (this.fallbackMode) {
       const safe = chatroomId.replace(/'/g, "''")
       const sqls = [
+        // Weixin 4.x: chatroom_member.room_id is an integer FK to chat_room.id
+        `SELECT COUNT(1) AS cnt FROM chatroom_member WHERE room_id=(SELECT id FROM chat_room WHERE username='${safe}')`,
+        // Weixin 3.x: ChatRoomMember table
         `SELECT COUNT(1) AS cnt FROM ChatRoomMember WHERE ChatRoomUserName='${safe}'`,
         `SELECT memberList FROM ChatRoom WHERE chatroomUserName='${safe}'`,
       ]
@@ -2020,6 +2418,9 @@ export class WcdbCore {
     if (this.fallbackMode) {
       const safe = chatroomId.replace(/'/g, "''")
       const sqls = [
+        // Weixin 4.x: chatroom_member.member_id matches rowid of name2id.username
+        `SELECT n.username FROM chatroom_member cm JOIN name2id n ON n.rowid=cm.member_id WHERE cm.room_id=(SELECT id FROM chat_room WHERE username='${safe}')`,
+        // Weixin 3.x: ChatRoomMember table
         `SELECT * FROM ChatRoomMember WHERE ChatRoomUserName='${safe}'`,
         `SELECT memberList FROM ChatRoom WHERE chatroomUserName='${safe}'`,
       ]
@@ -2030,7 +2431,12 @@ export class WcdbCore {
             const members = String(r.rows[0].memberList || '').split(';').filter(Boolean).map((m: string) => ({ UserName: m }))
             return { success: true, members }
           }
-          return { success: true, members: r.rows }
+          // Normalize: map 'name' column to 'username' for consistency
+          const members = r.rows.map((row: any) => ({
+            username: row.name || row.username || row.UserName || row.user_name || '',
+            ...row
+          }))
+          return { success: true, members }
         }
       }
       return { success: true, members: [] }
@@ -2124,10 +2530,25 @@ export class WcdbCore {
             const db = this.openFallbackDb(full)
             if (!db) continue
             try {
-              const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
-              const tbl = tables.find((t: any) => t.name.includes(sessionId.replace('@', '_').replace('.', '_')))?.name
+              // Weixin 4.x: Msg_<md5(sessionId)>
+              const md5Hash = require('crypto').createHash('md5').update(sessionId).digest('hex')
+              const wx4Name = `Msg_${md5Hash}`
+              const wx4Exists: any[] = db.prepare(
+                `SELECT name FROM sqlite_master WHERE type='table' AND name=?`
+              ).all(wx4Name)
+              let tbl: string | undefined
+              let timeCol: string
+              if (wx4Exists.length > 0) {
+                tbl = wx4Name
+                timeCol = 'create_time'
+              } else {
+                // Weixin 3.x fallback
+                const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+                tbl = tables.find((t: any) => t.name.includes(sessionId.replace('@', '_').replace('.', '_')))?.name
+                timeCol = 'CreateTime'
+              }
               if (!tbl) continue
-              const rows: any[] = db.prepare(`SELECT DISTINCT strftime('%Y-%m-%d', CreateTime, 'unixepoch') AS d FROM "${tbl}" WHERE CreateTime > 0`).all()
+              const rows: any[] = db.prepare(`SELECT DISTINCT strftime('%Y-%m-%d', ${timeCol}, 'unixepoch') AS d FROM "${tbl}" WHERE ${timeCol} > 0`).all()
               for (const row of rows) { if (row.d) seen.add(row.d) }
             } catch {}
           }
@@ -2173,8 +2594,20 @@ export class WcdbCore {
             const db = this.openFallbackDb(full)
             if (!db) continue
             try {
-              const tList: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
-              const tbl = tList.find((t: any) => t.name.includes(sessionId.replace('@', '_').replace('.', '_')))?.name
+              // Weixin 4.x: Msg_<md5(sessionId)>
+              const md5Hash = require('crypto').createHash('md5').update(sessionId).digest('hex')
+              const wx4Name = `Msg_${md5Hash}`
+              const wx4Exists: any[] = db.prepare(
+                `SELECT name FROM sqlite_master WHERE type='table' AND name=?`
+              ).all(wx4Name)
+              let tbl: string | undefined
+              if (wx4Exists.length > 0) {
+                tbl = wx4Name
+              } else {
+                // Weixin 3.x fallback
+                const tList: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
+                tbl = tList.find((t: any) => t.name.includes(sessionId.replace('@', '_').replace('.', '_')))?.name
+              }
               if (!tbl) continue
               const cnt: any = db.prepare(`SELECT COUNT(1) AS cnt FROM "${tbl}"`).get()
               tables.push({ tableName: tbl, count: cnt?.cnt ?? 0, dbPath: full })
@@ -2370,6 +2803,7 @@ export class WcdbCore {
       const years: Set<number> = new Set()
       const decryptedDir = this.fallbackDecryptedDir
       if (decryptedDir) {
+        const crypto = require('crypto')
         const walk = (dir: string) => {
           try {
             for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -2379,6 +2813,17 @@ export class WcdbCore {
               const db = this.openFallbackDb(full)
               if (!db) continue
               try {
+                // Weixin 4.x: Msg_<md5(sessionId)> tables with create_time column
+                for (const sid of sessionIds) {
+                  const md5 = crypto.createHash('md5').update(sid).digest('hex')
+                  const wx4Name = `Msg_${md5}`
+                  const wx4Exists: any[] = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).all(wx4Name)
+                  if (wx4Exists.length > 0) {
+                    const rows: any[] = db.prepare(`SELECT DISTINCT CAST(strftime('%Y', create_time, 'unixepoch') AS INTEGER) AS yr FROM "${wx4Name}" WHERE create_time > 0`).all()
+                    for (const row of rows) { if (row.yr) years.add(row.yr) }
+                  }
+                }
+                // Weixin 3.x: Chat_<encoded> tables with CreateTime column
                 const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
                 for (const t of tables) {
                   const hasSid = sessionIds.some(sid => t.name.includes(sid.replace('@', '_').replace('.', '_')))
@@ -2478,6 +2923,10 @@ export class WcdbCore {
       return { success: false, error: 'WCDB 未连接' }
     }
     if (!this.wcdbGetGroupStats) {
+      if (this.fallbackMode) {
+        const { begin, end } = this.normalizeRange(beginTimestamp, endTimestamp)
+        return this._getGroupStatsFallback(chatroomId, begin, end)
+      }
       return this.getAggregateStats([chatroomId], beginTimestamp, endTimestamp)
     }
     try {
@@ -2943,6 +3392,7 @@ export class WcdbCore {
       const lim = limit || 50
       const off = offset || 0
       const likeStr = `%${keyword.replace(/'/g, "''")}%`
+      const crypto = require('crypto')
       const walk = (dir: string) => {
         try {
           for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -2952,6 +3402,33 @@ export class WcdbCore {
             const db = this.openFallbackDb(full)
             if (!db) continue
             try {
+              // Weixin 4.x: search Msg_<md5> tables by message_content column
+              if (sessionId) {
+                // Search specific session
+                const md5 = crypto.createHash('md5').update(sessionId).digest('hex')
+                const wx4Name = `Msg_${md5}`
+                const wx4Exists: any[] = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).all(wx4Name)
+                if (wx4Exists.length > 0) {
+                  let whereStr = `message_content LIKE '${likeStr}'`
+                  if (beginTimestamp) whereStr += ` AND create_time >= ${beginTimestamp}`
+                  if (endTimestamp) whereStr += ` AND create_time <= ${endTimestamp}`
+                  const rows: any[] = db.prepare(`SELECT *, '${sessionId}' AS _session_id FROM "${wx4Name}" WHERE ${whereStr} ORDER BY create_time DESC LIMIT ${lim + off}`).all()
+                  messages.push(...rows)
+                }
+              } else {
+                // Search all Msg_* tables
+                const wx4Tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'").all()
+                for (const t of wx4Tables) {
+                  let whereStr = `message_content LIKE '${likeStr}'`
+                  if (beginTimestamp) whereStr += ` AND create_time >= ${beginTimestamp}`
+                  if (endTimestamp) whereStr += ` AND create_time <= ${endTimestamp}`
+                  try {
+                    const rows: any[] = db.prepare(`SELECT * FROM "${t.name}" WHERE ${whereStr} ORDER BY create_time DESC LIMIT ${lim}`).all()
+                    messages.push(...rows)
+                  } catch {}
+                }
+              }
+              // Weixin 3.x: Chat_* tables
               const tables: any[] = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'").all()
               for (const t of tables) {
                 if (sessionId && !t.name.includes(sessionId.replace('@', '_').replace('.', '_'))) continue
@@ -2996,18 +3473,77 @@ export class WcdbCore {
     }
   }
 
+  /** Parse a Weixin 4.x SnsTimeLine raw row (tid, user_name, content XML) into the structured format snsService expects */
+  private parseSnsTimelineRow4x(row: any): any {
+    const xml: string = row.content || ''
+    const get = (tag: string) => {
+      const m = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'))
+      return m ? m[1].trim() : ''
+    }
+    const getInt = (tag: string) => { const v = get(tag); return v ? parseInt(v, 10) : 0 }
+
+    // Parse media items from <mediaList><media>...</media></mediaList>
+    const media: any[] = []
+    const mediaListMatch = xml.match(/<mediaList>([\s\S]*?)<\/mediaList>/i)
+    if (mediaListMatch) {
+      const mediaItemRegex = /<media>([\s\S]*?)<\/media>/gi
+      let m: RegExpExecArray | null
+      while ((m = mediaItemRegex.exec(mediaListMatch[1])) !== null) {
+        const mx = m[1]
+        const getM = (tag: string) => { const r = mx.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i')); return r ? r[1].trim().replace(/&amp;/g, '&') : '' }
+        const url = getM('url') || getM('thumbUrl') || getM('cdnUrl')
+        const thumb = getM('thumbUrl') || getM('url')
+        const token = getM('token')
+        const encUrl = getM('encryptUrl') || getM('encrypt_url')
+        const aesKey = getM('aesKey') || getM('aes_key')
+        const mediaType = parseInt(getM('type') || '0', 10)
+        if (url || encUrl) media.push({ url, thumb, token, encryptUrl: encUrl || undefined, aesKey: aesKey || undefined, type: mediaType })
+      }
+    }
+
+    const username = row.user_name || ''
+    const nickname = get('nickname') || get('nickName') || username
+    const createTime = getInt('createTime') || getInt('createtime')
+    const type = getInt('type')
+    const contentDesc = get('contentDesc') || get('content')
+    const id = String(row.tid || '')
+
+    return {
+      id,
+      username,
+      nickname,
+      createTime,
+      type,
+      content: contentDesc,
+      rawXml: xml,
+      media,
+      comments: [],
+      likes: [],
+    }
+  }
+
   async getSnsTimeline(limit: number, offset: number, usernames?: string[], keyword?: string, startTime?: number, endTime?: number): Promise<{ success: boolean; timeline?: any[]; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
     // fallback 模式
     if (this.fallbackMode) {
       const sqlCandidates = [
+        // Weixin 4.x
+        `SELECT * FROM SnsTimeLine ORDER BY tid DESC LIMIT ${limit} OFFSET ${offset}`,
+        // Weixin 3.x
         `SELECT * FROM FeedsV20 ORDER BY createTime DESC LIMIT ${limit} OFFSET ${offset}`,
         `SELECT * FROM Feeds ORDER BY createTime DESC LIMIT ${limit} OFFSET ${offset}`,
         `SELECT * FROM SnsInfo ORDER BY createTime DESC LIMIT ${limit} OFFSET ${offset}`,
       ]
       for (const sql of sqlCandidates) {
         const r = this.execQueryFallback('sns', null, sql)
-        if (r.success) return { success: true, timeline: r.rows ?? [] }
+        if (!r.success) continue
+        const rows = r.rows ?? []
+        // If rows have 'tid' and 'user_name' it's Weixin 4.x raw XML — needs transformation
+        if (rows.length > 0 && rows[0].user_name !== undefined && rows[0].content !== undefined) {
+          const timeline = rows.map((row: any) => this.parseSnsTimelineRow4x(row))
+          return { success: true, timeline }
+        }
+        return { success: true, timeline: rows }
       }
       return { success: true, timeline: [] }
     }
@@ -3045,6 +3581,9 @@ export class WcdbCore {
     if (this.fallbackMode) {
       const { begin, end } = this.normalizeRange(beginTimestamp, endTimestamp)
       const sqlCandidates = [
+        // Weixin 4.x — SnsTimeLine has no createTime column; tid is a large negative int, use count all
+        `SELECT COUNT(1) AS total FROM SnsTimeLine`,
+        // Weixin 3.x
         `SELECT COUNT(1) AS total FROM FeedsV20 WHERE createTime >= ${begin} AND createTime <= ${end}`,
         `SELECT COUNT(1) AS total FROM Feeds WHERE createTime >= ${begin} AND createTime <= ${end}`,
         `SELECT COUNT(1) AS total FROM SnsInfo WHERE createTime >= ${begin} AND createTime <= ${end}`,

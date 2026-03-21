@@ -6,7 +6,7 @@ interface WorkerConfig {
   year: number
   friendUsername: string
   dbPath: string
-  decryptKey: string
+  wcdbKeys: Record<string, string>
   myWxid: string
   resourcesPath?: string
   userDataPath?: string
@@ -24,11 +24,12 @@ wcdbService.setPaths(config.resourcesPath || '', config.userDataPath || '')
 wcdbService.setLogEnabled(config.logEnabled === true)
 
 async function run() {
+  wcdbService.setWcdbKeys(config.wcdbKeys || {})
   const result = await dualReportService.generateReportWithConfig({
     year: config.year,
     friendUsername: config.friendUsername,
     dbPath: config.dbPath,
-    decryptKey: config.decryptKey,
+    wcdbKeys: config.wcdbKeys || {},
     wxid: config.myWxid,
     excludeWords: config.excludeWords,
     onProgress: (status: string, progress: number) => {

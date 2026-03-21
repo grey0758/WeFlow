@@ -5,6 +5,7 @@ import type { ExportDefaultDateRangeConfig } from '../utils/exportDateRange'
 // 配置键名
 export const CONFIG_KEYS = {
   DECRYPT_KEY: 'decryptKey',
+  WCDB_KEYS: 'wcdbKeys',
   DB_PATH: 'dbPath',
   MY_WXID: 'myWxid',
   WXID_CONFIGS: 'wxidConfigs',
@@ -105,6 +106,17 @@ export async function getDecryptKey(): Promise<string | null> {
 // 设置解密密钥
 export async function setDecryptKey(key: string): Promise<void> {
   await config.set(CONFIG_KEYS.DECRYPT_KEY, key)
+}
+
+// 获取 Weixin 4.x 多密钥
+export async function getWcdbKeys(): Promise<Record<string, string> | null> {
+  const value = await config.get(CONFIG_KEYS.WCDB_KEYS)
+  return (value && typeof value === 'object') ? value as Record<string, string> : null
+}
+
+// 设置 Weixin 4.x 多密钥
+export async function setWcdbKeys(keys: Record<string, string>): Promise<void> {
+  await config.set(CONFIG_KEYS.WCDB_KEYS, keys)
 }
 
 // 获取数据库路径

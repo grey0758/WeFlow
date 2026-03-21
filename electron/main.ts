@@ -1424,7 +1424,10 @@ function registerIpcHandlers() {
   })
 
   // WCDB 数据库相关
-  ipcMain.handle('wcdb:testConnection', async (_, dbPath: string, hexKey: string, wxid: string) => {
+  ipcMain.handle('wcdb:testConnection', async (_, dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) => {
+    if (wcdbKeys && Object.keys(wcdbKeys).length > 0) {
+      wcdbService.setWcdbKeys(wcdbKeys)
+    }
     return wcdbService.testConnection(dbPath, hexKey, wxid)
   })
 
@@ -2123,7 +2126,7 @@ function registerIpcHandlers() {
     configService = cfg
     return annualReportService.getAvailableYears({
       dbPath: cfg.get('dbPath'),
-      decryptKey: cfg.get('decryptKey'),
+      wcdbKeys: (cfg.get('wcdbKeys') as Record<string, string>) || {},
       wxid: cfg.get('myWxid')
     })
   })
@@ -2133,7 +2136,7 @@ function registerIpcHandlers() {
     configService = cfg
 
     const dbPath = cfg.get('dbPath')
-    const decryptKey = cfg.get('decryptKey')
+    const wcdbKeys = (cfg.get('wcdbKeys') as Record<string, string>) || {}
     const wxid = cfg.get('myWxid')
     const cacheKey = buildAnnualReportYearsCacheKey(dbPath, wxid)
 
@@ -2218,7 +2221,7 @@ function registerIpcHandlers() {
       try {
         const result = await annualReportService.getAvailableYears({
           dbPath,
-          decryptKey,
+          wcdbKeys,
           wxid,
           onProgress: (progress) => {
             if (isYearsLoadCanceled(taskId)) return
@@ -2320,7 +2323,7 @@ function registerIpcHandlers() {
     configService = cfg
 
     const dbPath = cfg.get('dbPath')
-    const decryptKey = cfg.get('decryptKey')
+    const wcdbKeys = (cfg.get('wcdbKeys') as Record<string, string>) || {}
     const wxid = cfg.get('myWxid')
     const logEnabled = cfg.get('logEnabled')
 
@@ -2333,7 +2336,7 @@ function registerIpcHandlers() {
 
     return await new Promise((resolve) => {
       const worker = new Worker(workerPath, {
-        workerData: { year, dbPath, decryptKey, myWxid: wxid, resourcesPath, userDataPath, logEnabled }
+        workerData: { year, dbPath, wcdbKeys, myWxid: wxid, resourcesPath, userDataPath, logEnabled }
       })
 
       const cleanup = () => {
@@ -2381,7 +2384,7 @@ function registerIpcHandlers() {
     configService = cfg
 
     const dbPath = cfg.get('dbPath')
-    const decryptKey = cfg.get('decryptKey')
+    const wcdbKeys = (cfg.get('wcdbKeys') as Record<string, string>) || {}
     const wxid = cfg.get('myWxid')
     const logEnabled = cfg.get('logEnabled')
     const friendUsername = payload?.friendUsername
@@ -2401,7 +2404,7 @@ function registerIpcHandlers() {
 
     return await new Promise((resolve) => {
       const worker = new Worker(workerPath, {
-        workerData: { year, friendUsername, dbPath, decryptKey, myWxid: wxid, resourcesPath, userDataPath, logEnabled, excludeWords }
+        workerData: { year, friendUsername, dbPath, wcdbKeys, myWxid: wxid, resourcesPath, userDataPath, logEnabled, excludeWords }
       })
 
       const cleanup = () => {

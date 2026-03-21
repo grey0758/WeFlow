@@ -139,13 +139,14 @@ class AnalyticsService {
   private async ensureConnected(): Promise<{ success: boolean; cleanedWxid?: string; error?: string }> {
     const wxid = this.configService.get('myWxid')
     const dbPath = this.configService.get('dbPath')
-    const decryptKey = this.configService.get('decryptKey')
+    const wcdbKeys = this.configService.get('wcdbKeys') as Record<string, string> | undefined
     if (!wxid) return { success: false, error: '未配置微信ID' }
     if (!dbPath) return { success: false, error: '未配置数据库路径' }
-    if (!decryptKey) return { success: false, error: '未配置解密密钥' }
+    if (!(wcdbKeys && Object.keys(wcdbKeys).length > 0)) return { success: false, error: '未配置解密密钥' }
 
     const cleanedWxid = this.cleanAccountDirName(wxid)
-    const ok = await wcdbService.open(dbPath, decryptKey, cleanedWxid)
+    wcdbService.setWcdbKeys(wcdbKeys)
+    const ok = await wcdbService.open(dbPath, '', cleanedWxid)
     if (!ok) return { success: false, error: 'WCDB 打开失败' }
     return { success: true, cleanedWxid }
   }

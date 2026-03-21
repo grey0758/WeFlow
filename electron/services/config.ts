@@ -17,6 +17,9 @@ interface ConfigSchema {
   imageAesKey: string
   wxidConfigs: Record<string, { decryptKey?: string; imageXorKey?: number; imageAesKey?: string; updatedAt?: number }>
 
+  // Weixin 4.x 多密钥模式: { salt_hex: key_hex }
+  wcdbKeys: Record<string, string>
+
   // 缓存相关
   cachePath: string
   lastOpenedDb: string
@@ -93,6 +96,7 @@ export class ConfigService {
         imageXorKey: 0,
         imageAesKey: '',
         wxidConfigs: {},
+        wcdbKeys: {},
         cachePath: '',
         lastOpenedDb: '',
         lastSession: '',

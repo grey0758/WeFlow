@@ -321,18 +321,24 @@ class ChatService {
       const wxid = this.configService.get('myWxid')
       const dbPath = this.configService.get('dbPath')
       const decryptKey = this.configService.get('decryptKey')
+      const wcdbKeys = this.configService.get('wcdbKeys') as Record<string, string> | undefined
       if (!wxid) {
         return { success: false, error: '请先在设置页面配置微信ID' }
       }
       if (!dbPath) {
         return { success: false, error: '请先在设置页面配置数据库路径' }
       }
-      if (!decryptKey) {
+      if (!decryptKey && !(wcdbKeys && Object.keys(wcdbKeys).length > 0)) {
         return { success: false, error: '请先在设置页面配置解密密钥' }
       }
 
+      // Weixin 4.x 多密钥模式：提前注入 wcdbKeys
+      if (wcdbKeys && Object.keys(wcdbKeys).length > 0) {
+        wcdbService.setWcdbKeys(wcdbKeys)
+      }
+
       const cleanedWxid = this.cleanAccountDirName(wxid)
-      const openOk = await wcdbService.open(dbPath, decryptKey, cleanedWxid)
+      const openOk = await wcdbService.open(dbPath, decryptKey || '', cleanedWxid)
       if (!openOk) {
         return { success: false, error: 'WCDB 打开失败，请检查路径和密钥' }
       }

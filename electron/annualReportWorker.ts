@@ -5,7 +5,7 @@ import { annualReportService } from './services/annualReportService'
 interface WorkerConfig {
   year: number
   dbPath: string
-  decryptKey: string
+  wcdbKeys: Record<string, string>
   myWxid: string
   resourcesPath?: string
   userDataPath?: string
@@ -22,10 +22,11 @@ wcdbService.setPaths(config.resourcesPath || '', config.userDataPath || '')
 wcdbService.setLogEnabled(config.logEnabled === true)
 
 async function run() {
+  wcdbService.setWcdbKeys(config.wcdbKeys || {})
   const result = await annualReportService.generateReportWithConfig({
     year: config.year,
     dbPath: config.dbPath,
-    decryptKey: config.decryptKey,
+    wcdbKeys: config.wcdbKeys || {},
     wxid: config.myWxid,
     onProgress: (status: string, progress: number) => {
       parentPort?.postMessage({

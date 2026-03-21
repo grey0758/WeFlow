@@ -74,6 +74,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
   const [activeTab, setActiveTab] = useState<SettingsTab>('appearance')
   const [decryptKey, setDecryptKey] = useState('')
+  const [wcdbKeys, setWcdbKeys] = useState<Record<string, string> | null>(null)
   const [imageXorKey, setImageXorKey] = useState('')
   const [imageAesKey, setImageAesKey] = useState('')
   const [dbPath, setDbPath] = useState('')
@@ -270,6 +271,8 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const loadConfig = async () => {
     try {
       const savedKey = await configService.getDecryptKey()
+      const savedWcdbKeys = await configService.getWcdbKeys()
+      if (savedWcdbKeys) setWcdbKeys(savedWcdbKeys)
       const savedPath = await configService.getDbPath()
       const savedWxid = await configService.getMyWxid()
       const savedCachePath = await configService.getCachePath()
@@ -729,11 +732,19 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       const result = await window.electronAPI.key.autoGetDbKey()
       if (result.success && result.key) {
         setDecryptKey(result.key)
+        setWcdbKeys(null)
         setDbKeyStatus('密钥获取成功')
         showMessage('已自动获取解密密钥', true)
         await syncCurrentKeys({ decryptKey: result.key, wxid })
         const keysOverride = buildKeysFromInputs({ decryptKey: result.key })
         await handleScanWxid(true, { preferCurrentKeys: true, showDialog: false, keysOverride })
+      } else if (result.success && result.wcdbKeys && Object.keys(result.wcdbKeys).length > 0) {
+        setWcdbKeys(result.wcdbKeys)
+        setDecryptKey('')
+        setDbKeyStatus(`密钥获取成功（多密钥模式，共 ${Object.keys(result.wcdbKeys).length} 个）`)
+        showMessage('已自动获取解密密钥（Weixin 4.x 多密钥模式）', true)
+        await configService.setWcdbKeys(result.wcdbKeys)
+        await handleScanWxid(true, { preferCurrentKeys: false, showDialog: false })
       } else {
         if (result.error?.includes('未找到微信安装路径') || result.error?.includes('启动微信失败')) {
           setIsManualStartPrompt(true)
@@ -845,13 +856,15 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
   const handleTestConnection = async () => {
     if (!dbPath) { showMessage('请先选择数据库目录', false); return }
-    if (!decryptKey) { showMessage('请先输入解密密钥', false); return }
-    if (decryptKey.length !== 64) { showMessage('密钥长度必须为64个字符', false); return }
+    if (!decryptKey && !wcdbKeys) { showMessage('请先输入解密密钥或使用自动获取', false); return }
+    if (decryptKey && decryptKey.length !== 64) { showMessage('密钥长度必须为64个字符', false); return }
     if (!wxid) { showMessage('请先输入或扫描 wxid', false); return }
 
     setIsTesting(true)
     try {
-      const result = await window.electronAPI.wcdb.testConnection(dbPath, decryptKey, wxid)
+      const result = await window.electronAPI.wcdb.testConnection(
+        dbPath, decryptKey || '', wxid, wcdbKeys ?? undefined
+      )
       if (result.success) {
         showMessage('连接测试成功！数据库可正常访问', true)
       } else {
@@ -1332,25 +1345,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     <div className="tab-content">
       <div className="form-group">
         <label>解密密钥</label>
-        <span className="form-hint">64位十六进制密钥</span>
-        <div className="input-with-toggle">
-          <input
-            type={showDecryptKey ? 'text' : 'password'}
-            placeholder="例如: a1b2c3d4e5f6..."
-            value={decryptKey}
-            onChange={(e) => {
-              const value = e.target.value
-              setDecryptKey(value)
-              if (value && value.length === 64) {
-                scheduleConfigSave('keys', () => syncCurrentKeys({ decryptKey: value, wxid }))
-                // showMessage('解密密钥已保存', true)
-              }
-            }}
-          />
-          <button type="button" className="toggle-visibility" onClick={() => setShowDecryptKey(!showDecryptKey)}>
-            {showDecryptKey ? <EyeOff size={14} /> : <Eye size={14} />}
-          </button>
-        </div>
         {isManualStartPrompt ? (
           <div className="manual-prompt">
             <p className="prompt-text">未能自动启动微信，请手动启动并登录后点击下方确认</p>
