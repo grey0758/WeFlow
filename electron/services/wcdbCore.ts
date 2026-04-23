@@ -624,9 +624,12 @@ export class WcdbCore {
       this.writeLog(`[bootstrap] initialize platform=${process.platform} execPath=${process.execPath || ''} dllPath=${dllPath} resourcesPath=${this.resourcesPath || ''} userDataPath=${this.userDataPath || ''}`, true)
 
       if (!existsSync(dllPath)) {
-        console.error('WCDB DLL 不存在:', dllPath)
-        this.writeLog(`[bootstrap] initialize failed: dll not found path=${dllPath}`, true)
-        return false
+        lastDllInitError = `WCDB DLL 文件缺失（${dllPath}）。已切换到自有 fallback，可继续读取和导出。`
+        console.warn('WCDB DLL 不存在，已切换到自有 fallback:', dllPath)
+        this.writeLog(`[bootstrap] initialize: dll not found path=${dllPath}; fallback remains usable`, true)
+        this.fallbackMode = true
+        this.initialized = true
+        return true
       }
 
       const dllDir = dirname(dllPath)
