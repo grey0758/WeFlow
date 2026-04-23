@@ -9,6 +9,7 @@ import type { ContactSnsTimelineTarget } from '../components/Sns/contactSnsTimel
 import JumpToDatePopover from '../components/JumpToDatePopover'
 import { ExportDateRangeDialog } from '../components/Export/ExportDateRangeDialog'
 import * as configService from '../services/config'
+import { useAppStore } from '../stores/appStore'
 import {
     finishBackgroundTask,
     isBackgroundTaskCancelRequested,
@@ -98,6 +99,7 @@ const normalizeAccountId = (value?: string | null): string => {
 const normalizeNameForCompare = (value?: string | null): string => String(value || '').trim().toLowerCase()
 
 export default function SnsPage() {
+    const isDbConnected = useAppStore((state) => state.isDbConnected)
     const [posts, setPosts] = useState<SnsPost[]>([])
     const [loading, setLoading] = useState(false)
     const [hasMore, setHasMore] = useState(true)
@@ -546,6 +548,10 @@ export default function SnsPage() {
     }, [ensureSnsCacheScopeKey])
 
     const loadOverviewStats = useCallback(async () => {
+        if (!isDbConnected) {
+            setOverviewStatsStatus('ready')
+            return
+        }
         setOverviewStatsStatus('loading')
         try {
             const statsResult = await window.electronAPI.sns.getExportStats()
@@ -591,7 +597,7 @@ export default function SnsPage() {
             console.error('Failed to load SNS overview stats:', error)
             setOverviewStatsStatus('error')
         }
-    }, [persistSnsPageCache])
+    }, [isDbConnected, persistSnsPageCache])
 
     const renderOverviewRangeText = () => {
         if (overviewStatsStatus === 'error') {
@@ -619,6 +625,12 @@ export default function SnsPage() {
     }, [])
 
     const loadPosts = useCallback(async (options: { reset?: boolean, direction?: 'older' | 'newer' } = {}) => {
+        if (!isDbConnected) {
+            loadingRef.current = false
+            setLoading(false)
+            setLoadingNewer(false)
+            return
+        }
         const { reset = false, direction = 'older' } = options
         if (loadingRef.current) {
             if (reset) {
@@ -742,7 +754,7 @@ export default function SnsPage() {
                 void loadPosts({ reset: true })
             }
         }
-    }, [persistSnsPageCache])
+    }, [isDbConnected, persistSnsPageCache])
 
     const stopContactsCountHydration = useCallback((resetProgress = false) => {
         contactsCountHydrationTokenRef.current += 1
@@ -765,6 +777,10 @@ export default function SnsPage() {
         usernames: string[],
         options?: { force?: boolean; readyUsernames?: Set<string> }
     ) => {
+        if (!isDbConnected) {
+            stopContactsCountHydration(true)
+            return
+        }
         const force = options?.force === true
         const targets = usernames
             .map((username) => String(username || '').trim())
@@ -914,10 +930,15 @@ export default function SnsPage() {
         }
 
         applyBatch()
-    }, [normalizePostCount, sortContactsForRanking, stopContactsCountHydration])
+    }, [isDbConnected, normalizePostCount, sortContactsForRanking, stopContactsCountHydration])
 
     // Load Contacts（先按最近会话显示联系人，再异步统计朋友圈条数并增量排序）
     const loadContacts = useCallback(async () => {
+        if (!isDbConnected) {
+            stopContactsCountHydration(true)
+            setContactsLoading(false)
+            return
+        }
         const requestToken = ++contactsLoadTokenRef.current
         const taskId = registerBackgroundTask({
             sourcePage: 'sns',
@@ -1090,7 +1111,7 @@ export default function SnsPage() {
                 setContactsLoading(false)
             }
         }
-    }, [ensureSnsUserPostCountsCacheScopeKey, hydrateContactPostCounts, sortContactsForRanking, stopContactsCountHydration])
+    }, [ensureSnsUserPostCountsCacheScopeKey, hydrateContactPostCounts, isDbConnected, sortContactsForRanking, stopContactsCountHydration])
 
     const closeAuthorTimeline = useCallback(() => {
         setAuthorTimelineTarget(null)
@@ -1140,10 +1161,15 @@ export default function SnsPage() {
 
     // Initial Load & Listeners
     useEffect(() => {
+        if (!isDbConnected) {
+            stopContactsCountHydration(true)
+            setOverviewStatsStatus('ready')
+            return
+        }
         void hydrateSnsPageCache()
         loadContacts()
         loadOverviewStats()
-    }, [hydrateSnsPageCache, loadContacts, loadOverviewStats])
+    }, [hydrateSnsPageCache, isDbConnected, loadContacts, loadOverviewStats, stopContactsCountHydration])
 
     useEffect(() => {
         const syncCurrentUserProfile = async () => {
@@ -1198,6 +1224,10 @@ export default function SnsPage() {
             setPosts([]); setHasMore(true); setHasNewer(false);
             setSelectedContactUsernames([])
             setSearchKeyword(''); setJumpTargetDate(undefined);
+            if (!isDbConnected) {
+                setOverviewStatsStatus('ready')
+                return
+            }
             void hydrateSnsPageCache()
             loadContacts();
             loadOverviewStats();
@@ -1205,14 +1235,15 @@ export default function SnsPage() {
         }
         window.addEventListener('wxid-changed', handleChange as EventListener)
         return () => window.removeEventListener('wxid-changed', handleChange as EventListener)
-    }, [hydrateSnsPageCache, loadContacts, loadOverviewStats, loadPosts, stopContactsCountHydration])
+    }, [hydrateSnsPageCache, isDbConnected, loadContacts, loadOverviewStats, loadPosts, stopContactsCountHydration])
 
     useEffect(() => {
+        if (!isDbConnected) return
         const timer = setTimeout(() => {
             loadPosts({ reset: true })
         }, 500)
         return () => clearTimeout(timer)
-    }, [searchKeyword, jumpTargetDate, loadPosts])
+    }, [isDbConnected, searchKeyword, jumpTargetDate, loadPosts])
 
     const selectedContactUsernamesKey = useMemo(
         () => selectedContactUsernames.join('||'),
@@ -1222,12 +1253,13 @@ export default function SnsPage() {
     const hasInitializedSelectedFeedFilterRef = useRef(false)
 
     useEffect(() => {
+        if (!isDbConnected) return
         if (!hasInitializedSelectedFeedFilterRef.current) {
             hasInitializedSelectedFeedFilterRef.current = true
             return
         }
         loadPosts({ reset: true })
-    }, [loadPosts, selectedContactUsernamesKey])
+    }, [isDbConnected, loadPosts, selectedContactUsernamesKey])
 
     const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
         const { scrollTop, clientHeight, scrollHeight } = e.currentTarget

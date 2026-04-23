@@ -10,14 +10,24 @@
  *   3. wcdbCore 的调用方直接用 better-sqlite3 读取解密后的明文 SQLite
  */
 
-import { execFile, spawn } from 'child_process'
+import { execFile } from 'child_process'
 import { join, dirname } from 'path'
 import { existsSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { promisify } from 'util'
-import { app } from 'electron'
-
 const execFileAsync = promisify(execFile)
+
+function getElectronAppPath(): string | null {
+  try {
+    const electron = require('electron')
+    const electronApp = electron?.app
+    if (electronApp && typeof electronApp.getAppPath === 'function') {
+      return electronApp.getAppPath()
+    }
+  } catch {}
+
+  return null
+}
 
 export interface PyAccountInfo {
   pid?: number
@@ -56,8 +66,28 @@ export class PyWxDumpService {
   private _decryptedDir: string | null = null
 
   constructor() {
-    this.pythonCmd = process.env.PYWXDUMP_PYTHON || 'python'
+    this.pythonCmd = this.resolvePythonCommand()
     this.bridgeScript = this.resolveBridgePath()
+  }
+
+  private resolvePythonCommand(): string {
+    const envPython = process.env.PYWXDUMP_PYTHON?.trim()
+    if (envPython) return envPython
+
+    const cwd = process.cwd()
+    const appPath = getElectronAppPath()
+    const candidates = [
+      join(cwd, '.venv-pywxdump', 'Scripts', 'python.exe'),
+      join(cwd, '.venv', 'Scripts', 'python.exe'),
+      appPath ? join(appPath, '.venv-pywxdump', 'Scripts', 'python.exe') : '',
+      appPath ? join(dirname(appPath), '.venv-pywxdump', 'Scripts', 'python.exe') : '',
+    ].filter(Boolean)
+
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) return candidate
+    }
+
+    return 'python'
   }
 
   private resolveBridgePath(): string {
@@ -74,11 +104,10 @@ export class PyWxDumpService {
     candidates.push(join(cwd, 'resources', 'pywxdump_bridge.py'))
 
     // app.getAppPath() 方式
-    try {
-      if (app && typeof app.getAppPath === 'function') {
-        candidates.push(join(app.getAppPath(), 'resources', 'pywxdump_bridge.py'))
-      }
-    } catch {}
+    const appPath = getElectronAppPath()
+    if (appPath) {
+      candidates.push(join(appPath, 'resources', 'pywxdump_bridge.py'))
+    }
 
     for (const p of candidates) {
       if (existsSync(p)) return p

@@ -131,10 +131,15 @@ export interface ElectronAPI {
     testConnection: (dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) => Promise<{ success: boolean; error?: string; sessionCount?: number }>
     open: (dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) => Promise<boolean>
     close: () => Promise<boolean>
-
+    getRuntimeStatus: () => Promise<{
+      initialized: boolean
+      fallbackMode: boolean
+      dllAvailable: boolean
+      dllInitError: string | null
+    }>
   }
   key: {
-    autoGetDbKey: () => Promise<{ success: boolean; key?: string; wcdbKeys?: Record<string, string>; error?: string; logs?: string[] }>
+    autoGetDbKey: () => Promise<{ success: boolean; key?: string; wcdbKeys?: Record<string, string>; error?: string; logs?: string[]; source?: 'pywxdump' | 'native' | 'dll' }>
     autoGetImageKey: (manualDir?: string, wxid?: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; error?: string }>
     scanImageKeyFromMemory: (userDir: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; error?: string }>
     onDbKeyStatus: (callback: (payload: { message: string; level: number }) => void) => () => void

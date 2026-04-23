@@ -4844,7 +4844,6 @@ class ChatService {
     const lowered = username.toLowerCase()
     // 排除所有 placeholder 会话（包括折叠群）
     if (lowered.includes('@placeholder')) return false
-    if (username.startsWith('gh_')) return false
 
     const excludeList = [
       'weixin', 'qqmail', 'fmessage', 'medianote', 'floatbottle',

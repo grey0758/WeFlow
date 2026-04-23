@@ -6202,17 +6202,34 @@ class ExportService {
     const cacheKey = this.buildExportStatsCacheKey(normalizedSessionIds, options, conn.cleanedWxid)
     const cachedStats = this.getExportStatsCacheEntry(cacheKey)
     if (cachedStats) {
-      const cachedResult = this.cloneExportStatsResult(cachedStats.result)
-      const orderedSessions: Array<{ sessionId: string; displayName: string; totalCount: number; voiceCount: number }> = []
-      const sessionMap = new Map(cachedResult.sessions.map((item) => [item.sessionId, item] as const))
-      for (const sessionId of normalizedSessionIds) {
-        const cachedSession = sessionMap.get(sessionId)
-        if (cachedSession) orderedSessions.push(cachedSession)
+      let trustCachedStats = true
+      if (
+        cachedStats.result.totalMessages <= 0 &&
+        this.isUnboundedDateRange(options.dateRange) &&
+        !String(options.senderUsername || '').trim()
+      ) {
+        const countsResult = await wcdbService.getMessageCounts(normalizedSessionIds)
+        if (countsResult.success && countsResult.counts) {
+          trustCachedStats = !normalizedSessionIds.some((sessionId) => {
+            const count = Number(countsResult.counts?.[sessionId] || 0)
+            return Number.isFinite(count) && count > 0
+          })
+        }
       }
-      if (orderedSessions.length === cachedResult.sessions.length) {
-        cachedResult.sessions = orderedSessions
+
+      if (trustCachedStats) {
+        const cachedResult = this.cloneExportStatsResult(cachedStats.result)
+        const orderedSessions: Array<{ sessionId: string; displayName: string; totalCount: number; voiceCount: number }> = []
+        const sessionMap = new Map(cachedResult.sessions.map((item) => [item.sessionId, item] as const))
+        for (const sessionId of normalizedSessionIds) {
+          const cachedSession = sessionMap.get(sessionId)
+          if (cachedSession) orderedSessions.push(cachedSession)
+        }
+        if (orderedSessions.length === cachedResult.sessions.length) {
+          cachedResult.sessions = orderedSessions
+        }
+        return cachedResult
       }
-      return cachedResult
     }
 
     const cleanedMyWxid = conn.cleanedWxid
@@ -6233,7 +6250,7 @@ class ExportService {
         if (!aggregatedData) {
           const statsResult = await chatService.getExportSessionStats(normalizedSessionIds, {
             includeRelations: false,
-            allowStaleCache: true
+            allowStaleCache: false
           })
           if (statsResult.success && statsResult.data) {
             aggregatedData = statsResult.data as Record<string, ExportAggregatedSessionMetric>
@@ -6241,6 +6258,37 @@ class ExportService {
           }
         }
         if (aggregatedData) {
+          const zeroMetricSessionIds = normalizedSessionIds.filter((sessionId) => {
+            const metric = aggregatedData?.[sessionId]
+            const totalCount = Number(metric?.totalMessages)
+            return !Number.isFinite(totalCount) || totalCount <= 0
+          })
+
+          if (zeroMetricSessionIds.length > 0) {
+            const countsResult = await wcdbService.getMessageCounts(zeroMetricSessionIds)
+            const suspiciousSessionIds = countsResult.success && countsResult.counts
+              ? zeroMetricSessionIds.filter((sessionId) => {
+                const count = Number(countsResult.counts?.[sessionId] || 0)
+                return Number.isFinite(count) && count > 0
+              })
+              : []
+
+            if (suspiciousSessionIds.length > 0) {
+              const refreshResult = await chatService.getExportSessionStats(suspiciousSessionIds, {
+                includeRelations: false,
+                forceRefresh: true,
+                allowStaleCache: false
+              })
+              if (refreshResult.success && refreshResult.data) {
+                aggregatedData = {
+                  ...aggregatedData,
+                  ...(refreshResult.data as Record<string, ExportAggregatedSessionMetric>)
+                }
+                this.setAggregatedSessionStatsCache(cacheKey, aggregatedData)
+              }
+            }
+          }
+
           const cachedVoiceCountMap = chatService.getCachedVoiceTranscriptCountMap(normalizedSessionIds)
           const fastRows = await parallelLimit(
             normalizedSessionIds,

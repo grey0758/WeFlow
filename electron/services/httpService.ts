@@ -5,13 +5,18 @@
 import * as http from 'http'
 import * as fs from 'fs'
 import * as path from 'path'
+import * as crypto from 'crypto'
+import * as fzstd from 'fzstd'
 import { URL } from 'url'
 import { chatService, Message } from './chatService'
 import { wcdbService } from './wcdbService'
 import { ConfigService } from './config'
+import { KeyService } from './keyService'
+import { nativeSqlcipherService } from './nativeSqlcipherService'
 import { videoService } from './videoService'
 import { imageDecryptService } from './imageDecryptService'
 import { groupAnalyticsService } from './groupAnalyticsService'
+import { wechatPayVerifierService } from './wechatPayVerifierService'
 
 // ChatLab 格式定义
 interface ChatLabHeader {
@@ -74,6 +79,31 @@ interface ApiExportedMedia {
   relativePath: string
 }
 
+interface PayApiEnvelope<T = any> {
+  requestId: string
+  success: boolean
+  code: string
+  message: string
+  timestamp: number
+  data: T | null
+}
+
+interface HiddenSessionSummaryItem {
+  username: string
+  talker: string
+  displayName: string
+  summary: string
+  category: 'official' | 'system'
+  reason: string
+  contactType: string | null
+  type: number
+  unreadCount: number
+  lastTimestamp: number
+  payLike: boolean
+  hasSummary: boolean
+  matchText: string
+}
+
 // ChatLab 消息类型映射
 const ChatLabType = {
   TEXT: 0,
@@ -104,6 +134,7 @@ class HttpService {
   private running: boolean = false
   private connections: Set<import('net').Socket> = new Set()
   private connectionMutex: boolean = false
+  private payApiNonceCache: Map<string, number> = new Map()
 
   constructor() {
     this.configService = ConfigService.getInstance()
@@ -118,6 +149,12 @@ class HttpService {
     }
 
     this.port = port
+
+    try {
+      await wechatPayVerifierService.start()
+    } catch (error) {
+      return { success: false, error: `Failed to start wechat pay verifier: ${String(error)}` }
+    }
 
     return new Promise((resolve) => {
       this.server = http.createServer((req, res) => this.handleRequest(req, res))
@@ -180,15 +217,20 @@ class HttpService {
           }
         }
 
-        this.server.close(() => {
+        this.server.close(async () => {
           this.running = false
           this.server = null
+          await wechatPayVerifierService.stop().catch((error) => {
+            console.error('[HttpService] Failed to stop wechat pay verifier:', error)
+          })
           console.log('[HttpService] HTTP API server stopped')
           resolve()
         })
       } else {
         this.running = false
-        resolve()
+        wechatPayVerifierService.stop().catch((error) => {
+          console.error('[HttpService] Failed to stop wechat pay verifier:', error)
+        }).finally(() => resolve())
       }
     })
   }
@@ -217,8 +259,8 @@ class HttpService {
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     // 设置 CORS 头
     res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-WeFlow-Timestamp, X-WeFlow-Nonce, X-WeFlow-Signature')
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204)
@@ -235,6 +277,20 @@ class HttpService {
         this.sendJson(res, { status: 'ok' })
       } else if (pathname === '/api/v1/messages') {
         await this.handleMessages(url, res)
+      } else if (pathname === '/api/v1/official-messages') {
+        await this.handleOfficialMessages(url, res)
+      } else if (pathname === '/api/v1/session-summaries') {
+        await this.handleSessionSummaries(url, res)
+      } else if (pathname === '/api/v1/wechat-pay-assistant') {
+        await this.handleWechatPayAssistant(url, res)
+      } else if (pathname === '/api/v1/wechat-pay-assistant/messages') {
+        await this.handleWechatPayAssistantMessages(url, res)
+      } else if (pathname === '/api/v1/wechat-pay-assistant/verify') {
+        await this.handleWechatPayAssistantVerify(req, url, res)
+      } else if (pathname === '/api/v1/wechat-pay-assistant/events') {
+        await this.handleWechatPayAssistantEvents(req, url, res)
+      } else if (pathname === '/api/v1/wechat-pay-assistant/sync') {
+        await this.handleWechatPayAssistantSync(req, url, res)
       } else if (pathname === '/api/v1/sessions') {
         await this.handleSessions(url, res)
       } else if (pathname === '/api/v1/contacts') {
@@ -361,6 +417,49 @@ class HttpService {
     const parsed = parseInt(value || '', 10)
     if (!Number.isFinite(parsed)) return defaultValue
     return Math.min(Math.max(parsed, min), max)
+  }
+
+  private async parseJsonBody(req: http.IncomingMessage): Promise<{ rawBody: string; json: Record<string, any> }> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = []
+      let totalLength = 0
+      const maxBytes = 1024 * 1024
+
+      req.on('data', (chunk: Buffer | string) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        totalLength += buffer.length
+        if (totalLength > maxBytes) {
+          reject(new Error('Request body too large'))
+          req.destroy()
+          return
+        }
+        chunks.push(buffer)
+      })
+
+      req.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8').trim()
+        if (!raw) {
+          resolve({ rawBody: '', json: {} })
+          return
+        }
+
+        try {
+          const parsed = JSON.parse(raw)
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            reject(new Error('Request body must be a JSON object'))
+            return
+          }
+          resolve({
+            rawBody: raw,
+            json: parsed as Record<string, any>
+          })
+        } catch {
+          reject(new Error('Invalid JSON body'))
+        }
+      })
+
+      req.on('error', (error) => reject(error))
+    })
   }
 
   private async backfillMissingSenderUsernames(talker: string, messages: Message[]): Promise<void> {
@@ -508,6 +607,965 @@ class HttpService {
         count: mediaMap.size
       },
       messages: apiMessages
+    })
+  }
+
+  private async handleOfficialMessages(url: URL, res: http.ServerResponse): Promise<void> {
+    const username = (
+      url.searchParams.get('username') ||
+      url.searchParams.get('talker') ||
+      ''
+    ).trim()
+    const name = (
+      url.searchParams.get('name') ||
+      url.searchParams.get('officialName') ||
+      ''
+    ).trim()
+
+    if (!username && !name) {
+      this.sendError(res, 400, 'Missing required parameter: username or name')
+      return
+    }
+
+    const contactsResult = await chatService.getContacts()
+    if (!contactsResult.success || !contactsResult.contacts) {
+      this.sendError(res, 500, contactsResult.error || 'Failed to get contacts')
+      return
+    }
+
+    const officialContacts = contactsResult.contacts.filter((contact) => contact.type === 'official')
+    let resolved = null as typeof officialContacts[number] | null
+
+    if (username) {
+      resolved = officialContacts.find((contact) => contact.username === username) || null
+      if (!resolved) {
+        this.sendError(res, 404, `Official account not found: ${username}`)
+        return
+      }
+    } else {
+      const normalized = name.toLowerCase()
+      const exactMatches = officialContacts.filter((contact) => (
+        String(contact.username || '').toLowerCase() === normalized ||
+        String(contact.displayName || '').toLowerCase() === normalized ||
+        String(contact.nickname || '').toLowerCase() === normalized ||
+        String(contact.remark || '').toLowerCase() === normalized ||
+        String(contact.alias || '').toLowerCase() === normalized
+      ))
+
+      const fuzzyMatches = exactMatches.length > 0
+        ? exactMatches
+        : officialContacts.filter((contact) => (
+          String(contact.username || '').toLowerCase().includes(normalized) ||
+          String(contact.displayName || '').toLowerCase().includes(normalized) ||
+          String(contact.nickname || '').toLowerCase().includes(normalized) ||
+          String(contact.remark || '').toLowerCase().includes(normalized) ||
+          String(contact.alias || '').toLowerCase().includes(normalized)
+        ))
+
+      if (fuzzyMatches.length === 0) {
+        this.sendError(res, 404, `Official account not found: ${name}`)
+        return
+      }
+
+      if (fuzzyMatches.length > 1) {
+        this.sendJson(res, {
+          success: false,
+          error: `Multiple official accounts matched: ${name}`,
+          count: fuzzyMatches.length,
+          candidates: fuzzyMatches.slice(0, 20).map((contact) => ({
+            username: contact.username,
+            displayName: contact.displayName,
+            remark: contact.remark,
+            nickname: contact.nickname,
+            alias: contact.alias
+          }))
+        }, 409)
+        return
+      }
+
+      resolved = fuzzyMatches[0]
+    }
+
+    url.searchParams.set('talker', resolved.username)
+    await this.handleMessages(url, res)
+  }
+
+  private getRawSessionUsername(row: Record<string, any>): string {
+    return String(
+      row.username ||
+      row.user_name ||
+      row.userName ||
+      row.usrName ||
+      row.UsrName ||
+      row.talker ||
+      row.talker_id ||
+      row.talkerId ||
+      ''
+    ).trim()
+  }
+
+  private classifyHiddenSession(username: string): {
+    hidden: boolean
+    category?: 'official' | 'system'
+    reason?: string
+  } {
+    const normalized = String(username || '').trim().toLowerCase()
+    if (!normalized || normalized.includes('@placeholder')) {
+      return { hidden: false }
+    }
+
+    if (normalized.startsWith('gh_')) {
+      return { hidden: true, category: 'official', reason: 'official-account' }
+    }
+
+    const excludedPrefixes = [
+      'weixin',
+      'qqmail',
+      'fmessage',
+      'medianote',
+      'floatbottle',
+      'newsapp',
+      'brandsessionholder',
+      'brandservicesessionholder',
+      'notifymessage',
+      'opencustomerservicemsg',
+      'notification_messages',
+      'userexperience_alarm',
+      'helper_folders',
+      '@helper_folders'
+    ]
+
+    for (const prefix of excludedPrefixes) {
+      if (normalized === prefix || normalized.startsWith(prefix)) {
+        return { hidden: true, category: 'system', reason: prefix }
+      }
+    }
+
+    if (normalized.includes('@kefu.openim') || normalized.includes('@openim')) {
+      return { hidden: true, category: 'system', reason: 'openim' }
+    }
+
+    if (normalized.includes('service_')) {
+      return { hidden: true, category: 'system', reason: 'service' }
+    }
+
+    return { hidden: false }
+  }
+
+  private async collectHiddenSessionSummaries(): Promise<{
+    success: boolean
+    summaries?: HiddenSessionSummaryItem[]
+    error?: string
+  }> {
+    const connectResult = await chatService.connect()
+    if (!connectResult.success) {
+      return { success: false, error: connectResult.error || 'Failed to connect chat service' }
+    }
+
+    const sessionsResult = await wcdbService.getSessions()
+    if (!sessionsResult.success || !sessionsResult.sessions) {
+      return { success: false, error: sessionsResult.error || 'Failed to get raw sessions' }
+    }
+
+    const rawRows = sessionsResult.sessions as Record<string, any>[]
+    const hiddenRows = rawRows.filter((row) => this.classifyHiddenSession(this.getRawSessionUsername(row)).hidden)
+
+    const usernames = Array.from(
+      new Set(
+        hiddenRows
+          .map((row) => this.getRawSessionUsername(row))
+          .filter(Boolean)
+      )
+    )
+
+    const [displayNamesResult, contactsResult] = await Promise.all([
+      usernames.length > 0
+        ? wcdbService.getDisplayNames(usernames)
+        : Promise.resolve({ success: true, map: {} as Record<string, string> }),
+      chatService.getContacts()
+    ])
+
+    const displayNameMap = displayNamesResult.success && displayNamesResult.map
+      ? displayNamesResult.map
+      : {}
+    const contactMap = new Map<string, { displayName?: string; type?: string; remark?: string; nickname?: string; alias?: string }>()
+    if (contactsResult.success && contactsResult.contacts) {
+      for (const contact of contactsResult.contacts) {
+        contactMap.set(contact.username, {
+          displayName: contact.displayName,
+          type: contact.type,
+          remark: contact.remark,
+          nickname: contact.nickname,
+          alias: contact.alias
+        })
+      }
+    }
+
+    const paymentKeywords = ['收款', '支付', '到账', 'pay', 'payment', 'transfer']
+    const summaries = hiddenRows.map((row) => {
+      const talker = this.getRawSessionUsername(row)
+      const hiddenInfo = this.classifyHiddenSession(talker)
+      const summary = String(row.summary || row.digest || row.last_msg || row.lastMsg || '').trim()
+      const contact = contactMap.get(talker)
+      const displayName = String(
+        contact?.displayName ||
+        displayNameMap[talker] ||
+        talker
+      ).trim()
+      const haystack = [
+        talker,
+        displayName,
+        contact?.remark,
+        contact?.nickname,
+        contact?.alias,
+        summary
+      ]
+        .map((item) => String(item || '').toLowerCase())
+        .join(' ')
+
+      return {
+        username: talker,
+        talker,
+        displayName,
+        summary,
+        category: (hiddenInfo.category || 'system') as 'official' | 'system',
+        reason: hiddenInfo.reason || '',
+        contactType: contact?.type || null,
+        type: Number.parseInt(String(row.type || '0'), 10) || 0,
+        unreadCount: Number.parseInt(String(row.unread_count || row.unreadCount || row.unreadcount || '0'), 10) || 0,
+        lastTimestamp: Number.parseInt(String(
+          row.last_timestamp ||
+          row.lastTimestamp ||
+          row.last_msg_time ||
+          row.lastMsgTime ||
+          row.sort_timestamp ||
+          row.sortTimestamp ||
+          '0'
+        ), 10) || 0,
+        payLike: paymentKeywords.some((item) => haystack.includes(item)),
+        hasSummary: Boolean(summary),
+        matchText: haystack
+      }
+    })
+
+    return { success: true, summaries }
+  }
+
+  private async handleSessionSummaries(url: URL, res: http.ServerResponse): Promise<void> {
+    const keyword = (url.searchParams.get('keyword') || '').trim().toLowerCase()
+    const username = (url.searchParams.get('username') || '').trim().toLowerCase()
+    const scope = (url.searchParams.get('scope') || 'all').trim().toLowerCase()
+    const payOnly = this.parseBooleanParam(url, ['payOnly', 'paymentOnly'], false)
+    const limit = this.parseIntParam(url.searchParams.get('limit'), 100, 1, 10000)
+
+    if (!['all', 'official', 'system'].includes(scope)) {
+      this.sendError(res, 400, 'Invalid scope, supported: all/official/system')
+      return
+    }
+
+    try {
+      const collected = await this.collectHiddenSessionSummaries()
+      if (!collected.success || !collected.summaries) {
+        this.sendError(res, 500, collected.error || 'Failed to collect hidden session summaries')
+        return
+      }
+
+      let summaries = [...collected.summaries]
+
+      if (scope !== 'all') {
+        summaries = summaries.filter((item) => item.category === scope)
+      }
+
+      if (username) {
+        summaries = summaries.filter((item) => item.username.toLowerCase().includes(username))
+      }
+
+      if (keyword) {
+        summaries = summaries.filter((item) => item.matchText.includes(keyword))
+      }
+
+      if (payOnly) {
+        summaries = summaries.filter((item) => item.payLike)
+      }
+
+      summaries.sort((a, b) => b.lastTimestamp - a.lastTimestamp)
+
+      const limited = summaries.slice(0, limit).map(({ matchText, ...item }) => item)
+      const categoryCounts = summaries.reduce((acc, item) => {
+        acc[item.category] = (acc[item.category] || 0) + 1
+        return acc
+      }, {} as Record<string, number>)
+
+      this.sendJson(res, {
+        success: true,
+        count: limited.length,
+        totalMatched: summaries.length,
+        scope,
+        payOnly,
+        categoryCounts,
+        sessions: limited
+      })
+    } catch (error) {
+      this.sendError(res, 500, String(error))
+    }
+  }
+
+  private cleanWxidDirName(value: string): string {
+    const trimmed = String(value || '').trim()
+    if (!trimmed) return ''
+    if (trimmed.toLowerCase().startsWith('wxid_')) {
+      const match = trimmed.match(/^(wxid_[^_]+)/i)
+      return match?.[1] || trimmed
+    }
+    const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
+    return suffixMatch ? suffixMatch[1] : trimmed
+  }
+
+  private resolveBizMessageDbPath(): { success: boolean; dbPath?: string; accountDir?: string; error?: string } {
+    const dbRoot = String(this.configService.get('dbPath') || '').trim()
+    const myWxid = String(this.configService.get('myWxid') || '').trim()
+    if (!dbRoot || !myWxid) {
+      return { success: false, error: 'Missing dbPath or myWxid in config' }
+    }
+
+    const directPath = path.join(dbRoot, myWxid, 'db_storage', 'message', 'biz_message_0.db')
+    if (fs.existsSync(directPath)) {
+      return { success: true, dbPath: directPath, accountDir: myWxid }
+    }
+
+    const cleanedWxid = this.cleanWxidDirName(myWxid)
+    const cleanedPath = path.join(dbRoot, cleanedWxid, 'db_storage', 'message', 'biz_message_0.db')
+    if (fs.existsSync(cleanedPath)) {
+      return { success: true, dbPath: cleanedPath, accountDir: cleanedWxid }
+    }
+
+    try {
+      const matchedDir = fs.readdirSync(dbRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .find((name) => name === cleanedWxid || name.startsWith(`${cleanedWxid}_`))
+
+      if (matchedDir) {
+        const matchedPath = path.join(dbRoot, matchedDir, 'db_storage', 'message', 'biz_message_0.db')
+        if (fs.existsSync(matchedPath)) {
+          return { success: true, dbPath: matchedPath, accountDir: matchedDir }
+        }
+      }
+    } catch {}
+
+    return { success: false, error: 'biz_message_0.db not found under configured dbPath' }
+  }
+
+  private decodeBizMessagePayload(raw: any): string {
+    if (!raw) return ''
+
+    let data: Buffer
+    if (Buffer.isBuffer(raw) || raw instanceof Uint8Array) {
+      data = Buffer.from(raw)
+    } else if (typeof raw === 'string') {
+      const trimmed = raw.trim()
+      if (trimmed.length > 16 && trimmed.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(trimmed)) {
+        data = Buffer.from(trimmed, 'hex')
+      } else {
+        data = Buffer.from(trimmed, 'utf8')
+      }
+    } else {
+      data = Buffer.from(String(raw || ''), 'utf8')
+    }
+
+    if (data.length >= 4) {
+      const magicLE = data.readUInt32LE(0)
+      const magicBE = data.readUInt32BE(0)
+      if (magicLE === 0xFD2FB528 || magicBE === 0xFD2FB528) {
+        try {
+          return Buffer.from(fzstd.decompress(data)).toString('utf8')
+        } catch {}
+      }
+    }
+
+    return data.toString('utf8')
+  }
+
+  private async ensureBizMessageKeysLoaded(): Promise<{ success: boolean; error?: string }> {
+    const currentKeys = this.configService.get('wcdbKeys') as Record<string, string> | undefined
+    if (currentKeys && Object.keys(currentKeys).length > 0) {
+      wcdbService.setWcdbKeys(currentKeys)
+    }
+
+    const keyService = new KeyService()
+    const result = await keyService.autoGetDbKey(30_000)
+    if (!result.success || !result.wcdbKeys || Object.keys(result.wcdbKeys).length === 0) {
+      return { success: false, error: result.error || 'Failed to load WCDB keys for biz_message_0.db' }
+    }
+
+    wcdbService.setWcdbKeys(result.wcdbKeys)
+    this.configService.set('wcdbKeys', result.wcdbKeys)
+    await wcdbService.shutdown().catch(() => {})
+    const reconnectResult = await chatService.connect()
+    if (!reconnectResult.success) {
+      return { success: false, error: reconnectResult.error || 'Failed to reconnect WCDB with refreshed keys' }
+    }
+    return { success: true }
+  }
+
+  private extractXmlValue(xml: string, tag: string): string {
+    const patterns = [
+      new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>`, 'i'),
+      new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i')
+    ]
+
+    for (const pattern of patterns) {
+      const match = xml.match(pattern)
+      if (match?.[1]) return match[1].trim()
+    }
+    return ''
+  }
+
+  private extractWechatPaySourceName(xml: string): string {
+    const patterns = [
+      /<category\b[^>]*>\s*<name><!\[CDATA\[([\s\S]*?)\]\]><\/name>/i,
+      /<source>\s*<name><!\[CDATA\[([\s\S]*?)\]\]><\/name>/i
+    ]
+
+    for (const pattern of patterns) {
+      const match = xml.match(pattern)
+      if (match?.[1]) return match[1].trim()
+    }
+    return ''
+  }
+
+  private buildWechatPayBizRecord(row: Record<string, any>, username: string) {
+    const rawXml = this.decodeBizMessagePayload(row.message_content)
+    const rawSourceXml = this.decodeBizMessagePayload(row.source)
+    const title = this.extractXmlValue(rawXml, 'title')
+    const description = this.extractXmlValue(rawXml, 'des')
+    const digest = this.extractXmlValue(rawXml, 'digest')
+    const url = this.extractXmlValue(rawXml, 'url')
+    const sourceName = this.extractWechatPaySourceName(rawXml)
+    const pubTime = Number.parseInt(this.extractXmlValue(rawXml, 'pub_time') || '0', 10) || 0
+    const mergedText = [title, description, digest, sourceName, rawXml].join('\n')
+    const amount = this.extractAmountFromText(mergedText)
+
+    return {
+      username,
+      localId: Number.parseInt(String(row.local_id || row.localId || '0'), 10) || 0,
+      serverId: String(row.server_id || row.serverId || ''),
+      localType: Number.parseInt(String(row.local_type || row.localType || '0'), 10) || 0,
+      createTime: Number.parseInt(String(row.create_time || row.createTime || '0'), 10) || 0,
+      publishedAt: pubTime || null,
+      sourceName,
+      title,
+      description,
+      digest,
+      amount,
+      url,
+      rawXml,
+      rawSourceXml
+    }
+  }
+
+  private async queryWechatPayBizMessages(username: string, limit: number) {
+    const resolved = this.resolveBizMessageDbPath()
+    if (!resolved.success || !resolved.dbPath) {
+      return { success: false, error: resolved.error || 'Failed to resolve biz_message_0.db path' }
+    }
+
+    const wcdbKeys = this.configService.get('wcdbKeys') as Record<string, string> | undefined
+    if (!(wcdbKeys && Object.keys(wcdbKeys).length > 0)) {
+      const reloadResult = await this.ensureBizMessageKeysLoaded()
+      if (!reloadResult.success) {
+        return { success: false, error: reloadResult.error || 'Failed to refresh WCDB keys' }
+      }
+    }
+
+    const effectiveKeys = this.configService.get('wcdbKeys') as Record<string, string> | undefined
+    if (!(effectiveKeys && Object.keys(effectiveKeys).length > 0)) {
+      return { success: false, error: 'WCDB keys are still unavailable after refresh' }
+    }
+
+    const tableName = `Msg_${crypto.createHash('md5').update(username).digest('hex')}`
+    const dbStoragePath = path.dirname(path.dirname(resolved.dbPath))
+    const decryptOutDir = path.join(process.env.TEMP || process.env.TMP || path.dirname(resolved.dbPath), 'weflow_http_api_biz', resolved.accountDir || 'default')
+    const decryptResult = await nativeSqlcipherService.decryptDbDir(
+      effectiveKeys,
+      dbStoragePath,
+      decryptOutDir
+    )
+    if (!decryptResult.success) {
+      return { success: false, error: decryptResult.error || 'Failed to decrypt biz_message_0.db' }
+    }
+
+    const decryptedBizPath = path.join(decryptOutDir, 'message', 'de_biz_message_0.db')
+    if (!fs.existsSync(decryptedBizPath)) {
+      return { success: false, error: 'de_biz_message_0.db was not produced by native decrypt' }
+    }
+
+    const BetterSqlite3 = require('better-sqlite3')
+    const db = new BetterSqlite3(decryptedBizPath, { readonly: true, fileMustExist: true })
+    try {
+      const safeTableName = tableName.replace(/'/g, "''")
+      const tableCheck = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = '${safeTableName}' LIMIT 1`).all()
+      if (!tableCheck || tableCheck.length === 0) {
+        return {
+          success: true,
+          dbPath: resolved.dbPath,
+          accountDir: resolved.accountDir,
+          tableName,
+          records: []
+        }
+      }
+
+      const rowLimit = Math.max(1, Math.min(limit, 1000))
+      const rows = db.prepare(`
+        SELECT local_id, server_id, local_type, create_time, source, message_content
+        FROM ${tableName}
+        ORDER BY create_time DESC, local_id DESC
+        LIMIT ${rowLimit}
+      `).all()
+
+      return {
+        success: true,
+        dbPath: resolved.dbPath,
+        accountDir: resolved.accountDir,
+        tableName,
+        records: rows.map((row: Record<string, any>) => this.buildWechatPayBizRecord(row, username))
+      }
+    } finally {
+      try { db.close() } catch {}
+    }
+  }
+
+  private parseAmountKeyword(raw: string): number | null {
+    const text = String(raw || '').trim()
+    if (!text) return null
+    const normalized = text.replace(/[^\d.]/g, '')
+    if (!normalized) return null
+    const parsed = Number.parseFloat(normalized)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+
+  private extractAmountFromText(raw: string): number | null {
+    const text = String(raw || '')
+    const match = text.match(/(\d+(?:\.\d{1,2})?)\s*元?/)
+    if (!match) return null
+    const parsed = Number.parseFloat(match[1])
+    return Number.isFinite(parsed) ? parsed : null
+  }
+
+  private isWechatPayAssistantSession(item: HiddenSessionSummaryItem): boolean {
+    const text = `${item.username} ${item.displayName} ${item.summary}`.toLowerCase()
+    return (
+      text.includes('gh_f0a92aa7146c') ||
+      text.includes('gh_3dfda90e39d6') ||
+      text.includes('brandservicesessionholder') ||
+      text.includes('微信收款助手') ||
+      text.includes('微信支付') ||
+      item.payLike
+    )
+  }
+
+  private async handleWechatPayAssistant(url: URL, res: http.ServerResponse): Promise<void> {
+    const amountParam = (url.searchParams.get('amount') || '').trim()
+    const merchant = (url.searchParams.get('merchant') || url.searchParams.get('shop') || '').trim().toLowerCase()
+    const limit = this.parseIntParam(url.searchParams.get('limit'), 100, 1, 10000)
+    const targetAmount = this.parseAmountKeyword(amountParam)
+
+    try {
+      const collected = await this.collectHiddenSessionSummaries()
+      if (!collected.success || !collected.summaries) {
+        this.sendError(res, 500, collected.error || 'Failed to collect hidden session summaries')
+        return
+      }
+
+      const officialContactsResult = await chatService.getContacts()
+      const officialContacts = (officialContactsResult.success && officialContactsResult.contacts
+        ? officialContactsResult.contacts.filter((contact) => (
+          contact.type === 'official' &&
+          ['gh_f0a92aa7146c', 'gh_3dfda90e39d6'].includes(contact.username)
+        ))
+        : []
+      ).map((contact) => ({
+        username: contact.username,
+        displayName: contact.displayName,
+        remark: contact.remark,
+        nickname: contact.nickname,
+        alias: contact.alias
+      }))
+
+      let records = collected.summaries
+        .filter((item) => this.isWechatPayAssistantSession(item))
+        .map((item) => {
+          const summaryAmount = this.extractAmountFromText(item.summary)
+          const merchantMatched = merchant
+            ? item.matchText.includes(merchant)
+            : null
+
+          return {
+            username: item.username,
+            displayName: item.displayName,
+            summary: item.summary,
+            category: item.category,
+            reason: item.reason,
+            contactType: item.contactType,
+            unreadCount: item.unreadCount,
+            lastTimestamp: item.lastTimestamp,
+            parsedAmount: summaryAmount,
+            amountMatched: targetAmount === null
+              ? null
+              : summaryAmount !== null && Math.abs(summaryAmount - targetAmount) < 0.0001,
+            merchantMatched,
+            messageHistoryAvailable: false,
+            source: 'hidden-session-summary'
+          }
+        })
+
+      if (targetAmount !== null) {
+        records = records.filter((item) => item.amountMatched === true)
+      }
+
+      if (merchant) {
+        records = records.filter((item) => item.merchantMatched === true)
+      }
+
+      records.sort((a, b) => b.lastTimestamp - a.lastTimestamp)
+      const limited = records.slice(0, limit)
+
+      this.sendJson(res, {
+        success: true,
+        recoveredFrom: 'hidden-session-summary',
+        amountFilter: targetAmount,
+        merchantFilter: merchant || null,
+        count: limited.length,
+        officialAccounts: officialContacts,
+        fullMessagesApi: '/api/v1/wechat-pay-assistant/messages',
+        records: limited,
+        notes: [
+          'Current local data exposes hidden session summaries for WeChat Pay Assistant related sessions.',
+          'Full biz-message recovery is now available through /api/v1/wechat-pay-assistant/messages when biz_message_0.db is readable.',
+          'When merchantFilter is provided here, only summary-layer text is searched.'
+        ]
+      })
+    } catch (error) {
+      this.sendError(res, 500, String(error))
+    }
+  }
+
+  private async handleWechatPayAssistantMessages(url: URL, res: http.ServerResponse): Promise<void> {
+    const usernameParam = (url.searchParams.get('username') || '').trim()
+    const scope = (url.searchParams.get('scope') || 'all').trim().toLowerCase()
+    const amountParam = (url.searchParams.get('amount') || '').trim()
+    const merchant = (url.searchParams.get('merchant') || url.searchParams.get('shop') || '').trim().toLowerCase()
+    const keyword = (url.searchParams.get('keyword') || '').trim().toLowerCase()
+    const limit = this.parseIntParam(url.searchParams.get('limit'), 100, 1, 1000)
+    const includeRaw = this.parseBooleanParam(url, ['includeRaw', 'raw'], false)
+    const targetAmount = this.parseAmountKeyword(amountParam)
+
+    const usernames = usernameParam
+      ? usernameParam.split(',').map((item) => item.trim()).filter(Boolean)
+      : scope === 'assistant'
+        ? ['gh_f0a92aa7146c']
+        : scope === 'pay'
+          ? ['gh_3dfda90e39d6']
+          : ['gh_f0a92aa7146c', 'gh_3dfda90e39d6']
+
+    if (usernames.length === 0) {
+      this.sendError(res, 400, 'Missing username')
+      return
+    }
+
+    try {
+      const connectResult = await chatService.connect()
+      if (!connectResult.success) {
+        this.sendError(res, 500, connectResult.error || 'Failed to connect chat service')
+        return
+      }
+
+      const perUserLimit = Math.max(limit, 200)
+      const collected = await Promise.all(
+        usernames.map((item) => this.queryWechatPayBizMessages(item, perUserLimit))
+      )
+
+      const failed = collected.find((item) => !item.success)
+      if (failed) {
+        this.sendError(res, 500, failed.error || 'Failed to query biz messages')
+        return
+      }
+
+      let records = collected.flatMap((item: any) => item.records || [])
+      if (targetAmount !== null) {
+        records = records.filter((item) => item.amount !== null && Math.abs((item.amount || 0) - targetAmount) < 0.0001)
+      }
+      if (merchant) {
+        records = records.filter((item) => `${item.title}\n${item.description}\n${item.digest}\n${item.rawXml}`.toLowerCase().includes(merchant))
+      }
+      if (keyword) {
+        records = records.filter((item) => `${item.title}\n${item.description}\n${item.digest}\n${item.rawXml}`.toLowerCase().includes(keyword))
+      }
+
+      records.sort((a, b) => {
+        if (b.createTime !== a.createTime) return b.createTime - a.createTime
+        return b.localId - a.localId
+      })
+
+      const limited = records.slice(0, limit).map((item) => includeRaw ? item : ({
+        username: item.username,
+        localId: item.localId,
+        serverId: item.serverId,
+        localType: item.localType,
+        createTime: item.createTime,
+        publishedAt: item.publishedAt,
+        sourceName: item.sourceName,
+        title: item.title,
+        description: item.description,
+        digest: item.digest,
+        amount: item.amount,
+        url: item.url
+      }))
+
+      this.sendJson(res, {
+        success: true,
+        recoveredFrom: 'biz_message_0.db',
+        scope,
+        usernames,
+        amountFilter: targetAmount,
+        merchantFilter: merchant || null,
+        keyword: keyword || null,
+        includeRaw,
+        count: limited.length,
+        totalMatched: records.length,
+        db: collected.map((item: any) => ({
+          username: usernames[collected.indexOf(item)] || null,
+          tableName: item.tableName,
+          accountDir: item.accountDir,
+          dbPath: item.dbPath
+        })),
+        records: limited
+      })
+    } catch (error) {
+      this.sendError(res, 500, String(error))
+    }
+  }
+
+  private async handleWechatPayAssistantVerify(
+    req: http.IncomingMessage,
+    url: URL,
+    res: http.ServerResponse
+  ): Promise<void> {
+    const requestId = crypto.randomUUID()
+    const method = String(req.method || 'GET').toUpperCase()
+    if (method !== 'GET' && method !== 'POST') {
+      this.sendPayApiError(res, requestId, 405, 'METHOD_NOT_ALLOWED', 'Method Not Allowed')
+      return
+    }
+
+    let body: Record<string, any> = {}
+    let rawBody = ''
+    if (method === 'POST') {
+      try {
+        const parsed = await this.parseJsonBody(req)
+        body = parsed.json
+        rawBody = parsed.rawBody
+      } catch (error) {
+        this.sendPayApiError(res, requestId, 400, 'INVALID_ARGUMENT', String(error))
+        return
+      }
+    }
+
+    const authError = this.verifyPayApiAuthorization(req, url, rawBody)
+    if (authError) {
+      this.sendPayApiError(res, requestId, authError.statusCode, authError.code, authError.message)
+      return
+    }
+
+    const amount = this.parseAmountKeyword(String(
+      body.amount ??
+      url.searchParams.get('amount') ??
+      ''
+    ))
+    if (amount === null || amount <= 0) {
+      this.sendPayApiError(res, requestId, 400, 'INVALID_ARGUMENT', 'Missing or invalid required parameter: amount')
+      return
+    }
+
+    const windowMinutes = this.parseIntParam(
+      this.firstDefinedString(
+        body.windowMinutes,
+        body.window,
+        url.searchParams.get('windowMinutes'),
+        url.searchParams.get('window')
+      ),
+      5,
+      1,
+      30 * 24 * 60
+    )
+
+    const merchant = this.cleanOptionalString(
+      body.merchant,
+      body.shop,
+      url.searchParams.get('merchant'),
+      url.searchParams.get('shop')
+    )
+    const keyword = this.cleanOptionalString(
+      body.keyword,
+      body.packageName,
+      body.package_name,
+      url.searchParams.get('keyword'),
+      url.searchParams.get('packageName'),
+      url.searchParams.get('package_name')
+    )
+    const payerName = this.cleanOptionalString(
+      body.payerName,
+      body.name,
+      url.searchParams.get('payerName'),
+      url.searchParams.get('name')
+    )
+    const payerPhone = this.cleanOptionalString(
+      body.payerPhone,
+      body.phone,
+      url.searchParams.get('payerPhone'),
+      url.searchParams.get('phone')
+    )
+    const orderNo = this.cleanOptionalString(
+      body.orderNo,
+      body.order_id,
+      url.searchParams.get('orderNo'),
+      url.searchParams.get('order_id')
+    )
+    const username = (
+      this.cleanOptionalString(body.username, url.searchParams.get('username'))
+      || 'gh_f0a92aa7146c'
+    ).toLowerCase()
+
+    const result = await wechatPayVerifierService.verifyPayment({
+      amount,
+      windowMinutes,
+      merchant: merchant || undefined,
+      keyword: keyword || undefined,
+      payerName: payerName || undefined,
+      payerPhone: payerPhone || undefined,
+      orderNo: orderNo || undefined,
+      username
+    })
+
+    const payload = {
+      ...result,
+      source: 'biz_message_0.db + local-cache',
+      criteria: {
+        amount,
+        windowMinutes,
+        merchant: merchant || null,
+        keyword: keyword || null,
+        payerName: payerName || null,
+        payerPhone: payerPhone || null,
+        orderNo: orderNo || null,
+        username
+      },
+      record: result.record || null
+    }
+
+    if (!result.success) {
+      const statusCode = result.message?.startsWith('Unsupported username') ? 400 : 500
+      const code = result.message?.startsWith('Unsupported username') ? 'INVALID_ARGUMENT' : 'INTERNAL_ERROR'
+      this.sendPayApiError(res, requestId, statusCode, code, result.message || 'Verification failed', payload)
+      return
+    }
+
+    if (result.verified) {
+      this.sendPayApiResponse(res, requestId, 200, 'OK', result.idempotent ? 'Payment already claimed by this order' : 'Payment verified', payload)
+      return
+    }
+
+    if (result.matched) {
+      this.sendPayApiResponse(res, requestId, 409, 'PAYMENT_ALREADY_CLAIMED', result.message || 'Matching payment was already claimed', payload)
+      return
+    }
+
+    this.sendPayApiResponse(res, requestId, 200, 'PAYMENT_NOT_FOUND', result.message || 'No matching payment found', payload)
+  }
+
+  private async handleWechatPayAssistantEvents(
+    req: http.IncomingMessage,
+    url: URL,
+    res: http.ServerResponse
+  ): Promise<void> {
+    const requestId = crypto.randomUUID()
+    if (String(req.method || 'GET').toUpperCase() !== 'GET') {
+      this.sendPayApiError(res, requestId, 405, 'METHOD_NOT_ALLOWED', 'Method Not Allowed')
+      return
+    }
+
+    const authError = this.verifyPayApiAuthorization(req, url, '')
+    if (authError) {
+      this.sendPayApiError(res, requestId, authError.statusCode, authError.code, authError.message)
+      return
+    }
+
+    const claimedRaw = url.searchParams.get('claimed')
+    const claimed = claimedRaw === null
+      ? undefined
+      : ['1', 'true', 'yes', 'on'].includes(claimedRaw.trim().toLowerCase())
+
+    const page = await wechatPayVerifierService.listReceiptEvents({
+      cursor: url.searchParams.get('cursor') || undefined,
+      limit: this.parseIntParam(url.searchParams.get('limit'), 50, 1, 200),
+      username: (url.searchParams.get('username') || '').trim() || undefined,
+      claimed
+    })
+
+    this.sendPayApiResponse(res, requestId, 200, 'OK', 'Events fetched', page)
+  }
+
+  private async handleWechatPayAssistantSync(
+    req: http.IncomingMessage,
+    url: URL,
+    res: http.ServerResponse
+  ): Promise<void> {
+    const requestId = crypto.randomUUID()
+    const method = String(req.method || 'GET').toUpperCase()
+    if (method !== 'GET' && method !== 'POST') {
+      this.sendPayApiError(res, requestId, 405, 'METHOD_NOT_ALLOWED', 'Method Not Allowed')
+      return
+    }
+
+    let body: Record<string, any> = {}
+    let rawBody = ''
+    if (method === 'POST') {
+      try {
+        const parsed = await this.parseJsonBody(req)
+        body = parsed.json
+        rawBody = parsed.rawBody
+      } catch (error) {
+        this.sendPayApiError(res, requestId, 400, 'INVALID_ARGUMENT', String(error))
+        return
+      }
+    }
+
+    const authError = this.verifyPayApiAuthorization(req, url, rawBody)
+    if (authError) {
+      this.sendPayApiError(res, requestId, authError.statusCode, authError.code, authError.message)
+      return
+    }
+
+    const force = this.parseBooleanLoose(
+      body.force,
+      body.full,
+      url.searchParams.get('force'),
+      url.searchParams.get('full')
+    )
+
+    const syncResult = await wechatPayVerifierService.syncNow(force)
+    await wechatPayVerifierService.flushWebhookDeliveries().catch((error) => {
+      console.error('[HttpService] flush webhook deliveries failed:', error)
+    })
+
+    if (!syncResult.success) {
+      this.sendPayApiError(res, requestId, 500, 'INTERNAL_ERROR', syncResult.error || 'Sync failed', syncResult)
+      return
+    }
+
+    this.sendPayApiResponse(res, requestId, 200, 'OK', 'Sync completed', {
+      ...syncResult,
+      force
     })
   }
 
@@ -1204,10 +2262,158 @@ class HttpService {
   /**
    * 发送 JSON 响应
    */
-  private sendJson(res: http.ServerResponse, data: any): void {
+  private sendJson(res: http.ServerResponse, data: any, statusCode: number = 200): void {
     res.setHeader('Content-Type', 'application/json; charset=utf-8')
-    res.writeHead(200)
+    res.writeHead(statusCode)
     res.end(JSON.stringify(data, null, 2))
+  }
+
+  private firstDefinedString(...values: unknown[]): string | null {
+    for (const value of values) {
+      if (value === null || value === undefined) {
+        continue
+      }
+      return String(value)
+    }
+    return null
+  }
+
+  private cleanOptionalString(...values: unknown[]): string {
+    for (const value of values) {
+      if (value === null || value === undefined) {
+        continue
+      }
+      const text = String(value).trim()
+      if (text) {
+        return text
+      }
+    }
+    return ''
+  }
+
+  private parseBooleanLoose(...values: unknown[]): boolean {
+    for (const value of values) {
+      if (value === null || value === undefined) {
+        continue
+      }
+
+      const normalized = String(value).trim().toLowerCase()
+      if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+        return true
+      }
+      if (['0', 'false', 'no', 'off'].includes(normalized)) {
+        return false
+      }
+    }
+    return false
+  }
+
+  private getPayApiSecret(): string {
+    return String(process.env.WEFLOW_PAY_API_SECRET || '').trim()
+  }
+
+  private verifyPayApiAuthorization(
+    req: http.IncomingMessage,
+    url: URL,
+    rawBody: string
+  ): { statusCode: number; code: string; message: string } | null {
+    const secret = this.getPayApiSecret()
+    if (!secret) {
+      return null
+    }
+
+    const timestamp = String(req.headers['x-weflow-timestamp'] || '').trim()
+    const nonce = String(req.headers['x-weflow-nonce'] || '').trim()
+    const signature = String(req.headers['x-weflow-signature'] || '').trim().toLowerCase()
+    if (!timestamp || !nonce || !signature) {
+      return {
+        statusCode: 401,
+        code: 'UNAUTHORIZED',
+        message: 'Missing required signature headers'
+      }
+    }
+
+    const timestampSeconds = Number.parseInt(timestamp, 10)
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    if (!Number.isFinite(timestampSeconds) || Math.abs(nowSeconds - timestampSeconds) > 300) {
+      return {
+        statusCode: 401,
+        code: 'UNAUTHORIZED',
+        message: 'Signature timestamp expired'
+      }
+    }
+
+    this.prunePayApiNonceCache(nowSeconds)
+    if (this.payApiNonceCache.has(nonce)) {
+      return {
+        statusCode: 409,
+        code: 'NONCE_REPLAY',
+        message: 'Nonce has already been used'
+      }
+    }
+
+    const bodyHash = crypto.createHash('sha256').update(rawBody || '').digest('hex')
+    const method = String(req.method || 'GET').toUpperCase()
+    const canonical = [method, `${url.pathname}${url.search}`, timestamp, nonce, bodyHash].join('\n')
+    const expectedSignature = crypto.createHmac('sha256', secret).update(canonical).digest('hex')
+
+    if (!this.safeCompare(signature, expectedSignature)) {
+      return {
+        statusCode: 403,
+        code: 'FORBIDDEN',
+        message: 'Invalid signature'
+      }
+    }
+
+    this.payApiNonceCache.set(nonce, nowSeconds + 600)
+    return null
+  }
+
+  private prunePayApiNonceCache(nowSeconds: number): void {
+    for (const [nonce, expiresAt] of this.payApiNonceCache.entries()) {
+      if (expiresAt <= nowSeconds) {
+        this.payApiNonceCache.delete(nonce)
+      }
+    }
+  }
+
+  private safeCompare(left: string, right: string): boolean {
+    const leftBuffer = Buffer.from(left)
+    const rightBuffer = Buffer.from(right)
+    if (leftBuffer.length !== rightBuffer.length) {
+      return false
+    }
+    return crypto.timingSafeEqual(leftBuffer, rightBuffer)
+  }
+
+  private sendPayApiResponse<T>(
+    res: http.ServerResponse,
+    requestId: string,
+    statusCode: number,
+    code: string,
+    message: string,
+    data: T | null
+  ): void {
+    const body: PayApiEnvelope<T> = {
+      requestId,
+      success: statusCode < 400,
+      code,
+      message,
+      timestamp: Math.floor(Date.now() / 1000),
+      data
+    }
+    this.sendJson(res, body, statusCode)
+  }
+
+  private sendPayApiError(
+    res: http.ServerResponse,
+    requestId: string,
+    statusCode: number,
+    code: string,
+    message: string,
+    data: any = null
+  ): void {
+    this.sendPayApiResponse(res, requestId, statusCode, code, message, data)
   }
 
   /**

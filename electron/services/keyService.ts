@@ -1,23 +1,25 @@
 import { app } from 'electron'
-import { join, dirname } from 'path'
+import { join, dirname, basename } from 'path'
 import { existsSync, copyFileSync, mkdirSync } from 'fs'
 import { execFile, spawn } from 'child_process'
 import { promisify } from 'util'
 import os from 'os'
 import crypto from 'crypto'
 import { pyWxDumpService } from './pyWxDumpService'
+import { dbPathService } from './dbPathService'
 
 const execFileAsync = promisify(execFile)
 
 type DbKeyResult = {
   success: boolean
   key?: string
-  wcdbKeys?: Record<string, string>  // 新版 Weixin 4.x: { salt_hex: key_hex }
+  wcdbKeys?: Record<string, string>
   error?: string
   logs?: string[]
-  source?: 'dll' | 'pywxdump'        // 标记密钥来源，供 wcdbCore 选择解密路径
+  source?: 'dll' | 'pywxdump' | 'native'
 }
-type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; error?: string }
+type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string }
+type DbVerificationTarget = { name: string; path: string; saltHex: string; markers: string[] }
 
 export class KeyService {
   private readonly isMac = process.platform === 'darwin'
@@ -69,6 +71,7 @@ export class KeyService {
 
   private getDllPath(): string {
     const isPackaged = typeof app !== 'undefined' && app ? app.isPackaged : process.env.NODE_ENV === 'production'
+    const archDir = process.arch === 'arm64' ? 'arm64' : 'x64'
     const candidates: string[] = []
 
     if (process.env.WX_KEY_DLL_PATH) {
@@ -76,11 +79,20 @@ export class KeyService {
     }
 
     if (isPackaged) {
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', 'wx_key.dll'))
       candidates.push(join(process.resourcesPath, 'resources', 'wx_key.dll'))
       candidates.push(join(process.resourcesPath, 'wx_key.dll'))
     } else {
       const cwd = process.cwd()
+      candidates.push(join(cwd, 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
+      candidates.push(join(cwd, 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
+      candidates.push(join(cwd, 'resources', 'key', 'win32', 'wx_key.dll'))
       candidates.push(join(cwd, 'resources', 'wx_key.dll'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', 'wx_key.dll'))
       candidates.push(join(app.getAppPath(), 'resources', 'wx_key.dll'))
     }
 
@@ -608,13 +620,1638 @@ export class KeyService {
       timeoutMs = 60_000,
       onStatus?: (message: string, level: number) => void
   ): Promise<DbKeyResult> {
+    return this._autoGetDbKeyChain(timeoutMs, onStatus)
     if (!this.ensureWin32()) return { success: false, error: '仅支持 Windows' }
-    // 完全弃用 wx_key.dll，直接通过 PyWxDump 获取数据库密钥
-    onStatus?.('正在通过 PyWxDump 获取数据库密钥...', 0)
-    return this._getDbKeyViaPyWxDump(onStatus)
+    if (!this.ensureLoaded()) return { success: false, error: 'wx_key.dll 未加载' }
+    if (!this.ensureKernel32()) return { success: false, error: 'Kernel32 Init Failed' }
+
+    const logs: string[] = []
+
+    onStatus?.('正在查找微信进程...', 0)
+    const pid = await this.findWeChatPid()
+    if (!pid) {
+      const err = '未找到微信进程，请先启动微信'
+      onStatus?.(err, 2)
+      return { success: false, error: err }
+    }
+
+    onStatus?.(`检测到微信窗口 (PID: ${pid})，正在获取...`, 0)
+    onStatus?.('正在检测微信界面组件...', 0)
+    await this.waitForWeChatWindowComponents(pid, 15000)
+
+    const ok = this.initHook(pid)
+    if (!ok) {
+      const error = this.getLastErrorMsg ? this.decodeCString(this.getLastErrorMsg()) : ''
+      if (error) {
+        if (error.includes('0xC0000022') || error.includes('ACCESS_DENIED') || error.includes('打开目标进程失败')) {
+          const friendlyError = '权限不足：无法访问微信进程。\n\n解决方法：\n1. 右键 WeFlow 图标，选择"以管理员身份运行"\n2. 关闭可能拦截的安全软件（如360、火绒等）\n3. 确保微信没有以管理员权限运行'
+          return { success: false, error: friendlyError }
+        }
+        return { success: false, error }
+      }
+      const statusBuffer = Buffer.alloc(256)
+      const levelOut = [0]
+      const status = this.getStatusMessage && this.getStatusMessage(statusBuffer, statusBuffer.length, levelOut)
+          ? this.decodeUtf8(statusBuffer)
+          : ''
+      return { success: false, error: status || '初始化失败' }
+    }
+
+    const keyBuffer = Buffer.alloc(128)
+    const start = Date.now()
+    let loginRequiredDetected = false
+
+    try {
+      while (Date.now() - start < timeoutMs) {
+        if (this.pollKeyData(keyBuffer, keyBuffer.length)) {
+          const key = this.decodeUtf8(keyBuffer)
+          if (key.length === 64) {
+            onStatus?.('密钥获取成功', 1)
+            return { success: true, key, logs }
+          }
+        }
+
+        for (let i = 0; i < 5; i++) {
+          const statusBuffer = Buffer.alloc(256)
+          const levelOut = [0]
+          if (!this.getStatusMessage(statusBuffer, statusBuffer.length, levelOut)) break
+          const msg = this.decodeUtf8(statusBuffer)
+          const level = levelOut[0] ?? 0
+          if (msg) {
+            logs.push(msg)
+            if (this.isLoginRelatedText(msg)) {
+              loginRequiredDetected = true
+            }
+            onStatus?.(msg, level)
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 120))
+      }
+    } finally {
+      try {
+        this.cleanupHook()
+      } catch { }
+    }
+
+    const loginRequired = loginRequiredDetected || await this.detectWeChatLoginRequired(pid)
+    if (loginRequired) {
+      return {
+        success: false,
+        error: '微信已启动但尚未完成登录，请先在微信客户端完成登录后再重试自动获取密钥。',
+        logs
+      }
+    }
+
+    return { success: false, error: '获取密钥超时', logs }
   }
 
-  /** 通过 PyWxDump 获取数据库密钥（DLL 失效时的替代方案） */
+  private isHexKey(value: unknown): value is string {
+    return typeof value === 'string' && /^[0-9a-fA-F]{64}$/.test(value.trim())
+  }
+
+  private normalizeWcdbKeys(value: unknown): Record<string, string> | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const result: Record<string, string> = {}
+    for (const [salt, key] of Object.entries(value as Record<string, unknown>)) {
+      const normalizedSalt = String(salt || '').trim().toLowerCase()
+      const normalizedKey = String(key || '').trim().toLowerCase()
+      if (!/^[0-9a-f]{32}$/.test(normalizedSalt)) continue
+      if (!/^[0-9a-f]{64}$/.test(normalizedKey)) continue
+      result[normalizedSalt] = normalizedKey
+    }
+    return Object.keys(result).length > 0 ? result : undefined
+  }
+
+  private parseDbKeyPayload(raw: string): DbKeyResult | null {
+    const trimmed = String(raw || '').trim()
+    if (!trimmed) return null
+
+    if (this.isHexKey(trimmed)) {
+      return { success: true, key: trimmed.toLowerCase(), source: 'dll' }
+    }
+
+    let parsed: any = null
+    try {
+      parsed = JSON.parse(trimmed)
+    } catch {
+      return null
+    }
+
+    const directWcdbKeys = this.normalizeWcdbKeys(parsed?.wcdb_keys ?? parsed?.wcdbKeys)
+    if (directWcdbKeys) {
+      return { success: true, wcdbKeys: directWcdbKeys, source: 'dll' }
+    }
+
+    if (this.isHexKey(parsed?.key)) {
+      return { success: true, key: String(parsed.key).trim().toLowerCase(), source: 'dll' }
+    }
+
+    const accounts = Array.isArray(parsed?.accounts) ? parsed.accounts : []
+    for (const account of accounts) {
+      const wcdbKeys = this.normalizeWcdbKeys(account?.wcdb_keys ?? account?.wcdbKeys)
+      if (wcdbKeys) {
+        return { success: true, wcdbKeys, source: 'dll' }
+      }
+      if (this.isHexKey(account?.key)) {
+        return { success: true, key: String(account.key).trim().toLowerCase(), source: 'dll' }
+      }
+    }
+
+    return null
+  }
+
+  private verifyLegacyDbKeyHex(keyHex: string, dbPath: string): boolean {
+    const verifier = this.createLegacyDbKeyVerifier(dbPath)
+    return verifier ? verifier(keyHex) : false
+  }
+
+  private verifySqlcipher4RawKeyHex(keyHex: string, dbPath: string): boolean {
+    const verifier = this.createSqlcipher4RawKeyVerifier(dbPath)
+    return verifier ? verifier(keyHex) : false
+  }
+
+  private createBestDbKeyVerifier(dbPath: string): ((keyHex: string) => boolean) | null {
+    return this.createSqlcipher4RawKeyVerifier(dbPath) ?? this.createLegacyDbKeyVerifier(dbPath)
+  }
+
+  private createLegacyDbKeyVerifier(dbPath: string): ((keyHex: string) => boolean) | null {
+    try {
+      if (!existsSync(dbPath)) return null
+      const { readFileSync } = require('fs') as typeof import('fs')
+      const fileBuffer = readFileSync(dbPath)
+      if (fileBuffer.length < 4096) return null
+
+      const salt = fileBuffer.subarray(0, 16)
+      const firstPage = fileBuffer.subarray(16, 4096)
+      const macSalt = Buffer.alloc(salt.length)
+      for (let i = 0; i < salt.length; i++) macSalt[i] = salt[i] ^ 58
+
+      return (keyHex: string): boolean => {
+        try {
+          if (!this.isHexKey(keyHex)) return false
+          const password = Buffer.from(keyHex.trim(), 'hex')
+          const derivedKey = crypto.pbkdf2Sync(password, salt, 64000, 32, 'sha1')
+          const macKey = crypto.pbkdf2Sync(derivedKey, macSalt, 2, 32, 'sha1')
+          const hashMac = crypto.createHmac('sha1', macKey)
+          hashMac.update(firstPage.subarray(0, firstPage.length - 32))
+          hashMac.update(Buffer.from([0x01, 0x00, 0x00, 0x00]))
+          const digest = hashMac.digest()
+          return digest.equals(firstPage.subarray(firstPage.length - 32, firstPage.length - 12))
+        } catch {
+          return false
+        }
+      }
+    } catch {
+      return null
+    }
+  }
+
+  private createSqlcipher4RawKeyVerifier(dbPath: string): ((keyHex: string) => boolean) | null {
+    try {
+      if (!existsSync(dbPath)) return null
+      const { readFileSync } = require('fs') as typeof import('fs')
+      const fileBuffer = readFileSync(dbPath)
+      if (fileBuffer.length < 4096) return null
+
+      const salt = fileBuffer.subarray(0, 16)
+      const firstPage = fileBuffer.subarray(16, 4096)
+      if (salt.length < 16 || firstPage.length < 64) return null
+
+      const macSalt = Buffer.alloc(salt.length)
+      for (let i = 0; i < salt.length; i++) macSalt[i] = salt[i] ^ 0x3a
+      const pageBody = firstPage.subarray(0, firstPage.length - 64)
+      const pageMac = firstPage.subarray(firstPage.length - 64)
+      const pageNumber = Buffer.from([0x01, 0x00, 0x00, 0x00])
+
+      return (keyHex: string): boolean => {
+        try {
+          if (!this.isHexKey(keyHex)) return false
+          const rawKey = Buffer.from(keyHex.trim(), 'hex')
+          if (rawKey.length !== 32) return false
+          const macKey = crypto.pbkdf2Sync(rawKey, macSalt, 2, 32, 'sha512')
+          const digest = crypto.createHmac('sha512', macKey)
+            .update(pageBody)
+            .update(pageNumber)
+            .digest()
+          return digest.equals(pageMac)
+        } catch {
+          return false
+        }
+      }
+    } catch {
+      return null
+    }
+  }
+
+  private collectDbMarkerTexts(fullPath: string, relativePath: string): string[] {
+    const normalizedFullPath = fullPath.replace(/\//g, '\\')
+    const ntPrefixedFullPath = `\\\\??\\\\${normalizedFullPath}`
+    const markers = new Set<string>([
+      normalizedFullPath,
+      ntPrefixedFullPath,
+      `${normalizedFullPath}.factory\\renew\\${basename(fullPath)}`,
+      `${normalizedFullPath}.factory\\vacuum\\${basename(fullPath)}`,
+      `${ntPrefixedFullPath}.factory\\renew\\${basename(fullPath)}`,
+      `${ntPrefixedFullPath}.factory\\vacuum\\${basename(fullPath)}`,
+      `db_storage\\${relativePath.replace(/\//g, '\\')}`,
+      basename(fullPath)
+    ])
+    const normalizedRelativePath = relativePath.replace(/\//g, '\\')
+    if (normalizedRelativePath) {
+      markers.add(normalizedRelativePath)
+    }
+    return Array.from(markers).filter(Boolean)
+  }
+
+  private extractUtf16HexCandidates(buffer: Buffer): string[] {
+    const matches = buffer.toString('latin1').match(/(?:[0-9a-fA-F]\x00){64}/g) ?? []
+    const candidates = new Set<string>()
+    for (const match of matches) {
+      const candidate = match.replace(/\x00/g, '').toLowerCase()
+      if (this.isHexKey(candidate)) {
+        candidates.add(candidate)
+      }
+    }
+    return Array.from(candidates)
+  }
+
+  private isLikelyProcessAddress(value: number): boolean {
+    return Number.isFinite(value) && value >= 0x10000 && value <= 0x7fffffffffff
+  }
+
+  private collectReadableProcessRegions(
+    VirtualQueryEx: any,
+    hProcess: any,
+    allowedProtectFlags: number,
+    maxRegionSize: number
+  ): Array<[number, number]> {
+    const regions: Array<[number, number]> = []
+    const MEM_COMMIT = 0x1000
+    const PAGE_NOACCESS = 0x01
+    const PAGE_GUARD = 0x100
+    const MBI_SIZE = 48
+    const mbi = Buffer.alloc(MBI_SIZE)
+    let address = 0
+
+    while (address < 0x7fffffffffff) {
+      const ret = VirtualQueryEx(hProcess, address, mbi, MBI_SIZE)
+      if (ret === 0) break
+
+      const base = Number(mbi.readBigUInt64LE(0))
+      const size = Number(mbi.readBigUInt64LE(24))
+      const state = mbi.readUInt32LE(32)
+      const protect = mbi.readUInt32LE(36)
+
+      if (
+        state === MEM_COMMIT &&
+        protect !== PAGE_NOACCESS &&
+        (protect & PAGE_GUARD) === 0 &&
+        (protect & allowedProtectFlags) !== 0 &&
+        size > 0 &&
+        size <= maxRegionSize
+      ) {
+        regions.push([base, size])
+      }
+
+      const next = base + size
+      if (next <= address) break
+      address = next
+    }
+
+    return regions
+  }
+
+  private readProcessBuffer(
+    ReadProcessMemory: any,
+    hProcess: any,
+    address: number,
+    size: number
+  ): Buffer | null {
+    try {
+      if (!this.isLikelyProcessAddress(address) || size <= 0) return null
+      const buffer = Buffer.alloc(size)
+      const bytesRead = Buffer.alloc(8)
+      const ok = ReadProcessMemory(hProcess, address, buffer, size, bytesRead)
+      if (!ok) return null
+      const actualBytes = Number(bytesRead.readBigUInt64LE(0))
+      if (actualBytes <= 0) return null
+      return buffer.subarray(0, actualBytes)
+    } catch {
+      return null
+    }
+  }
+
+  private findVerifiedCandidateInBuffer(
+    buffer: Buffer,
+    verifyKey: (candidate: string) => boolean,
+    seenCandidates: Set<string>,
+    options?: {
+      rawStep?: number
+      maxRawCandidates?: number
+    }
+  ): string | null {
+    const asciiMatches = buffer.toString('latin1').match(/(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/g) ?? []
+    for (const match of asciiMatches) {
+      const candidate = match.toLowerCase()
+      if (seenCandidates.has(candidate)) continue
+      seenCandidates.add(candidate)
+      if (verifyKey(candidate)) return candidate
+    }
+
+    for (const candidate of this.extractUtf16HexCandidates(buffer)) {
+      if (seenCandidates.has(candidate)) continue
+      seenCandidates.add(candidate)
+      if (verifyKey(candidate)) return candidate
+    }
+
+    const rawStep = Math.max(1, options?.rawStep ?? (buffer.length > 512 ? 8 : 1))
+    let rawCount = 0
+    for (let pos = 0; pos <= buffer.length - 32; pos += rawStep) {
+      if (options?.maxRawCandidates && rawCount >= options.maxRawCandidates) break
+      const candidate = buffer.subarray(pos, pos + 32).toString('hex')
+      if (seenCandidates.has(candidate)) continue
+      seenCandidates.add(candidate)
+      rawCount++
+      if (verifyKey(candidate)) return candidate
+    }
+
+    return null
+  }
+
+  private findVerifiedCandidateViaPointers(
+    ReadProcessMemory: any,
+    hProcess: any,
+    window: Buffer,
+    verifyKey: (candidate: string) => boolean,
+    seenCandidates: Set<string>,
+    seenPointers: Set<number>
+  ): string | null {
+    for (let offset = 0; offset <= window.length - 8; offset += 8) {
+      const pointer = Number(window.readBigUInt64LE(offset))
+      if (
+        !this.isLikelyProcessAddress(pointer) ||
+        this.isLikelyUtf16FragmentPointer(pointer) ||
+        this.isLikelyModulePointer(pointer) ||
+        seenPointers.has(pointer)
+      ) {
+        continue
+      }
+      seenPointers.add(pointer)
+
+      const pointed = this.readProcessBuffer(ReadProcessMemory, hProcess, pointer, 160)
+      if (!pointed || pointed.length < 32) continue
+
+      const candidate = this.findVerifiedCandidateInBuffer(pointed, verifyKey, seenCandidates, {
+        rawStep: 8,
+        maxRawCandidates: 24
+      })
+      if (candidate) return candidate
+    }
+
+    return null
+  }
+
+  private isLikelyUtf16FragmentPointer(value: number): boolean {
+    if (!Number.isFinite(value) || value <= 0 || value > 0x7fffffffffff) return false
+    try {
+      const bytes = Buffer.alloc(8)
+      bytes.writeBigUInt64LE(BigInt(value))
+      let asciiPairs = 0
+      let zeroOddBytes = 0
+      for (let index = 0; index < 6; index += 2) {
+        const lo = bytes[index]
+        const hi = bytes[index + 1]
+        if (hi === 0) zeroOddBytes++
+        if (hi === 0 && lo >= 0x20 && lo <= 0x7e) asciiPairs++
+      }
+      return asciiPairs >= 3 && zeroOddBytes >= 3
+    } catch {
+      return false
+    }
+  }
+
+  private isLikelyModulePointer(value: number): boolean {
+    return Number.isFinite(value) && value >= 0x7ff000000000 && value <= 0x7fffffffffff
+  }
+
+  private extractPointerValues(buffer: Buffer, limit = 64): number[] {
+    const pointers: number[] = []
+    const seen = new Set<number>()
+    for (let offset = 0; offset <= buffer.length - 8; offset += 8) {
+      const pointer = Number(buffer.readBigUInt64LE(offset))
+      if (
+        !this.isLikelyProcessAddress(pointer) ||
+        this.isLikelyUtf16FragmentPointer(pointer) ||
+        this.isLikelyModulePointer(pointer) ||
+        seen.has(pointer)
+      ) {
+        continue
+      }
+      seen.add(pointer)
+      pointers.push(pointer)
+      if (pointers.length >= limit) break
+    }
+    return pointers
+  }
+
+  private formatProcessAddress(address: number): string {
+    return `0x${address.toString(16)}`
+  }
+
+  private decodeUtf16FragmentValue(value: number): string {
+    try {
+      const bytes = Buffer.alloc(8)
+      bytes.writeBigUInt64LE(BigInt(value))
+      return bytes.toString('utf16le').replace(/\u0000+$/g, '')
+    } catch {
+      return ''
+    }
+  }
+
+  private describeQwordValue(value: number): string {
+    if (value === 0) return 'zero'
+    if (this.isLikelyModulePointer(value)) return `module ${this.formatProcessAddress(value)}`
+    if (this.isLikelyProcessAddress(value)) return `ptr ${this.formatProcessAddress(value)}`
+    if (this.isLikelyUtf16FragmentPointer(value)) {
+      const decoded = this.decodeUtf16FragmentValue(value)
+      return decoded ? `utf16 "${decoded}"` : 'utf16-fragment'
+    }
+    return `raw ${this.formatProcessAddress(value)}`
+  }
+
+  private shouldTraceDetailedLayout(targetName: string, address: number): boolean {
+    const exactMatches: Record<string, number[]> = {
+      'contact.db': [
+        0x25b539a5120, 0x25b539ad630, 0x25b539a80d0, 0x25b539acb60, 0x25b539acb90, 0x25b539ae2e0,
+        0x25b539ad900, 0x25b539ad180, 0x25b539acbf0, 0x25b539acc20, 0x25b539ae760, 0x25b539adda0,
+        0x25b539add70, 0x25b539ae340, 0x25b539ae190, 0x25b539ae730
+      ],
+      'sns.db': [0x25b5398ca30, 0x25b5398d210, 0x25b5398cd30, 0x25b539a4f10, 0x25b539a4b20, 0x25b5398d2d0, 0x25b5398d450, 0x25b539a59b0]
+    }
+    return (exactMatches[targetName] ?? []).includes(address)
+  }
+
+  private shouldTraceFocusedContactEntry(address: number): boolean {
+    return [0x25b539ad630, 0x25b539a80d0, 0x25b539acb60, 0x25b539acb90, 0x25b539ae2e0].includes(address)
+  }
+
+  private shouldTraceFocusedContactOwner(address: number): boolean {
+    return [0x25b539ad900, 0x25b539ad180, 0x25b539acbf0, 0x25b539acc20, 0x25b539ae760, 0x25b539adda0].includes(address)
+  }
+
+  private shouldCollectFocusedContactHub(address: number): boolean {
+    return [0x25b539ad660, 0x25b539acbc0, 0x25b539add40, 0x25b539ae310, 0x25b539add70].includes(address)
+  }
+
+  private shouldTraceFocusedContactCore(address: number): boolean {
+    return [0x25b539add70, 0x25b539ae340].includes(address)
+  }
+
+  private shouldTraceFocusedContactDeepCore(address: number): boolean {
+    return [0x25b539ae190, 0x25b539ae730].includes(address)
+  }
+
+  private shouldTraceFocusedContactSingleCore(address: number): boolean {
+    return address === 0x25b539ae370
+  }
+
+  private prioritizeFocusedContactSingleCoreChildren(children: number[]): number[] {
+    const priority = [
+      0x25b539ae160,
+      0x25b539ae730,
+      0x25b539ae190,
+      0x25b539ac140,
+      0x25b539abfc0,
+      0x25b539ae820,
+      0x25b539ad930,
+      0x25b539adc90
+    ]
+    const order = new Map<number, number>(priority.map((address, index) => [address, index]))
+    return [...children].sort((left, right) => {
+      const leftRank = order.get(left) ?? Number.MAX_SAFE_INTEGER
+      const rightRank = order.get(right) ?? Number.MAX_SAFE_INTEGER
+      return leftRank - rightRank || left - right
+    })
+  }
+
+  private getDetailedLayoutReadSize(targetName: string, address: number, fallbackSize: number): number {
+    return this.shouldTraceDetailedLayout(targetName, address) ? Math.max(fallbackSize, 0x100) : fallbackSize
+  }
+
+  private traceDetailedLayout(
+    targetName: string,
+    stage: string,
+    address: number,
+    buffer: Buffer,
+    onStatus?: (message: string, level: number) => void,
+    force = false
+  ) {
+    if (!onStatus || (!force && !this.shouldTraceDetailedLayout(targetName, address))) return
+
+    onStatus(`Native scan: [${targetName}] layout ${stage} ${this.formatProcessAddress(address)}`, 0)
+    for (let offset = 0; offset <= Math.min(buffer.length - 8, 0xb8); offset += 8) {
+      const value = Number(buffer.readBigUInt64LE(offset))
+      onStatus(
+        `Native scan: [${targetName}]   +0x${offset.toString(16).padStart(2, '0')} = ${this.describeQwordValue(value)}`,
+        0
+      )
+    }
+  }
+
+  private collectFilteredChildPointers(buffer: Buffer, limit = 8): number[] {
+    const pointers: number[] = []
+    const seen = new Set<number>()
+    for (let offset = 0; offset <= Math.min(buffer.length - 8, 0xb8); offset += 8) {
+      const value = Number(buffer.readBigUInt64LE(offset))
+      if (
+        !this.isLikelyProcessAddress(value) ||
+        this.isLikelyUtf16FragmentPointer(value) ||
+        this.isLikelyModulePointer(value) ||
+        seen.has(value)
+      ) {
+        continue
+      }
+      seen.add(value)
+      pointers.push(value)
+      if (pointers.length >= limit) break
+    }
+    return pointers
+  }
+
+  private summarizeNodeHead(buffer: Buffer): string {
+    const summary: string[] = []
+    for (let offset = 0; offset <= Math.min(buffer.length - 8, 0x38); offset += 8) {
+      const value = Number(buffer.readBigUInt64LE(offset))
+      summary.push(`+0x${offset.toString(16).padStart(2, '0')}=${this.describeQwordValue(value)}`)
+    }
+    return summary.join(' | ')
+  }
+
+  private appendContactHubGraph(
+    graph: Map<number, Set<number>>,
+    parent: number,
+    children: number[]
+  ) {
+    if (!this.shouldCollectFocusedContactHub(parent) || children.length === 0) return
+    const set = graph.get(parent) ?? new Set<number>()
+    for (const child of children) {
+      set.add(child)
+    }
+    graph.set(parent, set)
+  }
+
+  private computeSharedContactHubCandidates(
+    graph: Map<number, Set<number>>
+  ): Array<{ address: number; parents: number[] }> {
+    const parentByChild = new Map<number, Set<number>>()
+    for (const [parent, children] of graph.entries()) {
+      for (const child of children) {
+        const parents = parentByChild.get(child) ?? new Set<number>()
+        parents.add(parent)
+        parentByChild.set(child, parents)
+      }
+    }
+
+    return Array.from(parentByChild.entries())
+      .map(([address, parents]) => ({ address, parents: Array.from(parents).sort((a, b) => a - b) }))
+      .filter((entry) => entry.parents.length >= 2)
+      .sort((left, right) => right.parents.length - left.parents.length || left.address - right.address)
+  }
+
+  private collectCrossBackrefs(
+    buffer: Buffer,
+    targets: Set<number>
+  ): number[] {
+    const hits: number[] = []
+    const seen = new Set<number>()
+    for (const pointer of this.collectFilteredChildPointers(buffer, 12)) {
+      if (!targets.has(pointer) || seen.has(pointer)) continue
+      seen.add(pointer)
+      hits.push(pointer)
+    }
+    return hits
+  }
+
+  private findVerifiedCandidateViaFocusedContactSingleCore(
+    ReadProcessMemory: any,
+    hProcess: any,
+    coreAddress: number,
+    coreChildren: number[],
+    verifyKey: (candidate: string) => boolean,
+    seenCandidates: Set<string>,
+    onStatus?: (message: string, level: number) => void
+  ): string | null {
+    if (!this.shouldTraceFocusedContactSingleCore(coreAddress)) return null
+
+    const queue: Array<{ address: number; depth: number; stage: string }> = [
+      { address: coreAddress, depth: 0, stage: 'single-core' },
+      ...this.prioritizeFocusedContactSingleCoreChildren(coreChildren).map((address) => ({
+        address,
+        depth: 1,
+        stage: 'single-core-child'
+      }))
+    ]
+    const visited = new Set<number>()
+    const backlinkTargets = new Set<number>([coreAddress, ...coreChildren])
+
+    while (queue.length > 0 && visited.size < 24) {
+      const current = queue.shift()!
+      if (!this.isLikelyProcessAddress(current.address) || visited.has(current.address)) continue
+      visited.add(current.address)
+
+      const readSize = current.depth === 0 ? 0x180 : 0x140
+      const buffer = this.readProcessBuffer(ReadProcessMemory, hProcess, current.address, readSize)
+      if (!buffer || buffer.length < 32) continue
+
+      this.traceDetailedLayout('contact.db', current.stage, current.address, buffer, onStatus, current.depth <= 1)
+      const directCandidate = this.findVerifiedCandidateInBuffer(buffer, verifyKey, seenCandidates, {
+        rawStep: 1,
+        maxRawCandidates: current.depth === 0 ? 256 : 192
+      })
+      if (directCandidate) {
+        onStatus?.(`Native scan: [contact.db] focused single-core hit ${this.formatProcessAddress(current.address)}`, 1)
+        return directCandidate
+      }
+
+      const childPointers = this.collectFilteredChildPointers(buffer, current.depth === 0 ? 12 : 8)
+      const prioritizedChildren = current.depth === 0
+        ? this.prioritizeFocusedContactSingleCoreChildren(childPointers)
+        : childPointers
+
+      if (current.depth <= 1 && prioritizedChildren.length > 0) {
+        onStatus?.(
+          `Native scan: [contact.db] ${current.stage} children ${this.formatProcessAddress(current.address)} -> ${prioritizedChildren.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+          0
+        )
+      }
+
+      for (const child of prioritizedChildren) {
+        const childBuffer = this.readProcessBuffer(ReadProcessMemory, hProcess, child, current.depth === 0 ? 0x120 : 0x100)
+        if (!childBuffer || childBuffer.length < 32) continue
+
+        if (current.depth <= 1) {
+          onStatus?.(`Native scan: [contact.db] ${current.stage} child ${this.formatProcessAddress(child)} ${this.summarizeNodeHead(childBuffer)}`, 0)
+          const backrefs = this.collectCrossBackrefs(childBuffer, backlinkTargets)
+          if (backrefs.length > 0) {
+            onStatus?.(
+              `Native scan: [contact.db] ${current.stage} child backrefs ${this.formatProcessAddress(child)} -> ${backrefs.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+              0
+            )
+          }
+        }
+
+        const childCandidate = this.findVerifiedCandidateInBuffer(childBuffer, verifyKey, seenCandidates, {
+          rawStep: 1,
+          maxRawCandidates: 160
+        })
+        if (childCandidate) {
+          onStatus?.(`Native scan: [contact.db] focused single-core child hit ${this.formatProcessAddress(child)}`, 1)
+          return childCandidate
+        }
+
+        if (current.depth < 2 && !visited.has(child)) {
+          queue.push({
+            address: child,
+            depth: current.depth + 1,
+            stage: current.depth === 0 ? 'single-core-child' : 'single-core-grandchild'
+          })
+        }
+      }
+    }
+
+    return null
+  }
+
+  private traceSharedContactHubCandidates(
+    ReadProcessMemory: any,
+    hProcess: any,
+    graph: Map<number, Set<number>>,
+    verifyKey: (candidate: string) => boolean,
+    seenCandidates: Set<string>,
+    onStatus?: (message: string, level: number) => void
+  ): string | null {
+    if (!onStatus || graph.size === 0) return null
+
+    for (const [parent, children] of graph.entries()) {
+      const preview = Array.from(children).slice(0, 6).map((value) => this.formatProcessAddress(value)).join(', ')
+      onStatus(`Native scan: [contact.db] hub ${this.formatProcessAddress(parent)} -> ${preview}`, 0)
+    }
+
+    const sharedCandidates = this.computeSharedContactHubCandidates(graph)
+    if (sharedCandidates.length === 0) {
+      onStatus('Native scan: [contact.db] shared hub candidates none', 0)
+      return null
+    }
+
+    const focusedCandidates = sharedCandidates.slice(0, 3)
+    const preview = focusedCandidates
+      .map((entry) => `${this.formatProcessAddress(entry.address)}<=${entry.parents.map((value) => this.formatProcessAddress(value)).join('/')}`)
+      .join(', ')
+    onStatus(`Native scan: [contact.db] shared hub candidates ${preview}`, 0)
+
+    const backlinkTargets = new Set<number>([
+      ...Array.from(graph.keys()),
+      ...focusedCandidates.map((entry) => entry.address)
+    ])
+    const sharedNextLayer = new Map<number, Set<number>>()
+
+    for (const entry of focusedCandidates) {
+      const buffer = this.readProcessBuffer(ReadProcessMemory, hProcess, entry.address, 0x80)
+      if (!buffer || buffer.length < 32) continue
+
+      onStatus(`Native scan: [contact.db] shared candidate ${this.formatProcessAddress(entry.address)} ${this.summarizeNodeHead(buffer)}`, 0)
+      const children = this.collectFilteredChildPointers(buffer, 6)
+      if (children.length > 0) {
+        onStatus(
+          `Native scan: [contact.db] shared candidate children ${this.formatProcessAddress(entry.address)} -> ${children.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+          0
+        )
+      }
+
+      for (const child of children) {
+        const parents = sharedNextLayer.get(child) ?? new Set<number>()
+        parents.add(entry.address)
+        sharedNextLayer.set(child, parents)
+
+        const childBuffer = this.readProcessBuffer(ReadProcessMemory, hProcess, child, 0x60)
+        if (!childBuffer || childBuffer.length < 32) continue
+
+        const backrefs = this.collectCrossBackrefs(childBuffer, backlinkTargets)
+        if (backrefs.length > 0) {
+          onStatus(
+            `Native scan: [contact.db] shared child backrefs ${this.formatProcessAddress(child)} -> ${backrefs.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+            0
+          )
+        }
+      }
+    }
+
+    const sharedNextLayerCandidates = Array.from(sharedNextLayer.entries())
+      .map(([address, parents]) => ({ address, parents: Array.from(parents).sort((a, b) => a - b) }))
+      .filter((entry) => entry.parents.length >= 2)
+      .sort((left, right) => right.parents.length - left.parents.length || left.address - right.address)
+
+      if (sharedNextLayerCandidates.length > 0) {
+        const nextPreview = sharedNextLayerCandidates
+          .slice(0, 8)
+          .map((entry) => `${this.formatProcessAddress(entry.address)}<=${entry.parents.map((value) => this.formatProcessAddress(value)).join('/')}`)
+          .join(', ')
+      onStatus(`Native scan: [contact.db] shared next-layer candidates ${nextPreview}`, 0)
+
+      const focusedCoreCandidates = sharedNextLayerCandidates.filter((entry) => this.shouldTraceFocusedContactCore(entry.address))
+        if (focusedCoreCandidates.length > 0) {
+          const coreBacklinkTargets = new Set<number>([
+            ...Array.from(graph.keys()),
+            ...focusedCandidates.map((entry) => entry.address),
+            ...focusedCoreCandidates.map((entry) => entry.address)
+          ])
+          const processedDeepCore = new Set<number>()
+          const deepCoreGraph = new Map<number, Set<number>>()
+
+          for (const entry of focusedCoreCandidates) {
+            const buffer = this.readProcessBuffer(ReadProcessMemory, hProcess, entry.address, 0x100)
+            if (!buffer || buffer.length < 32) continue
+
+          this.traceDetailedLayout('contact.db', 'core', entry.address, buffer, onStatus)
+          const children = this.collectFilteredChildPointers(buffer, 8)
+          if (children.length > 0) {
+            onStatus(
+              `Native scan: [contact.db] core children ${this.formatProcessAddress(entry.address)} -> ${children.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+              0
+            )
+          }
+
+            for (const child of children) {
+              const childBuffer = this.readProcessBuffer(ReadProcessMemory, hProcess, child, 0x60)
+              if (!childBuffer || childBuffer.length < 32) continue
+
+              onStatus(`Native scan: [contact.db] core child ${this.formatProcessAddress(child)} ${this.summarizeNodeHead(childBuffer)}`, 0)
+              const backrefs = this.collectCrossBackrefs(childBuffer, coreBacklinkTargets)
+              if (backrefs.length > 0) {
+                onStatus(
+                  `Native scan: [contact.db] core child backrefs ${this.formatProcessAddress(child)} -> ${backrefs.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+                  0
+                )
+              }
+
+              if (this.shouldTraceFocusedContactDeepCore(child) && !processedDeepCore.has(child)) {
+                processedDeepCore.add(child)
+
+                const deepCoreBuffer = this.readProcessBuffer(ReadProcessMemory, hProcess, child, 0x100)
+                if (!deepCoreBuffer || deepCoreBuffer.length < 32) continue
+
+                this.traceDetailedLayout('contact.db', 'deep-core', child, deepCoreBuffer, onStatus)
+                const deepChildren = this.collectFilteredChildPointers(deepCoreBuffer, 8)
+                if (deepChildren.length > 0) {
+                  onStatus(
+                    `Native scan: [contact.db] deep core children ${this.formatProcessAddress(child)} -> ${deepChildren.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+                    0
+                  )
+                }
+                deepCoreGraph.set(child, new Set<number>(deepChildren))
+
+                const deepBacklinkTargets = new Set<number>([
+                  ...Array.from(coreBacklinkTargets),
+                  child
+                ])
+
+                for (const deepChild of deepChildren) {
+                  const deepChildBuffer = this.readProcessBuffer(ReadProcessMemory, hProcess, deepChild, 0x60)
+                  if (!deepChildBuffer || deepChildBuffer.length < 32) continue
+
+                  onStatus(`Native scan: [contact.db] deep core child ${this.formatProcessAddress(deepChild)} ${this.summarizeNodeHead(deepChildBuffer)}`, 0)
+                  const deepBackrefs = this.collectCrossBackrefs(deepChildBuffer, deepBacklinkTargets)
+                  if (deepBackrefs.length > 0) {
+                    onStatus(
+                      `Native scan: [contact.db] deep core child backrefs ${this.formatProcessAddress(deepChild)} -> ${deepBackrefs.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+                      0
+                    )
+                  }
+                }
+              }
+            }
+          }
+
+          const sharedDeepCoreCandidates = this.computeSharedContactHubCandidates(deepCoreGraph)
+          if (sharedDeepCoreCandidates.length > 0) {
+            const deepPreview = sharedDeepCoreCandidates
+              .slice(0, 8)
+              .map((entry) => `${this.formatProcessAddress(entry.address)}<=${entry.parents.map((value) => this.formatProcessAddress(value)).join('/')}`)
+              .join(', ')
+            onStatus(`Native scan: [contact.db] shared deep-core candidates ${deepPreview}`, 0)
+
+            const deepSharedBacklinkTargets = new Set<number>([
+              ...Array.from(coreBacklinkTargets),
+              ...Array.from(deepCoreGraph.keys()),
+              ...sharedDeepCoreCandidates.map((entry) => entry.address)
+            ])
+
+            for (const entry of sharedDeepCoreCandidates.slice(0, 4)) {
+              const sharedBuffer = this.readProcessBuffer(ReadProcessMemory, hProcess, entry.address, 0x100)
+              if (!sharedBuffer || sharedBuffer.length < 32) continue
+
+              this.traceDetailedLayout('contact.db', 'deep-shared', entry.address, sharedBuffer, onStatus, true)
+              const sharedChildren = this.collectFilteredChildPointers(sharedBuffer, 8)
+              if (sharedChildren.length > 0) {
+                onStatus(
+                  `Native scan: [contact.db] deep shared children ${this.formatProcessAddress(entry.address)} -> ${sharedChildren.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+                  0
+                )
+              }
+
+              for (const sharedChild of sharedChildren) {
+                const sharedChildBuffer = this.readProcessBuffer(ReadProcessMemory, hProcess, sharedChild, 0x60)
+                if (!sharedChildBuffer || sharedChildBuffer.length < 32) continue
+
+                onStatus(`Native scan: [contact.db] deep shared child ${this.formatProcessAddress(sharedChild)} ${this.summarizeNodeHead(sharedChildBuffer)}`, 0)
+                const sharedBackrefs = this.collectCrossBackrefs(sharedChildBuffer, deepSharedBacklinkTargets)
+                if (sharedBackrefs.length > 0) {
+                  onStatus(
+                    `Native scan: [contact.db] deep shared child backrefs ${this.formatProcessAddress(sharedChild)} -> ${sharedBackrefs.map((value) => this.formatProcessAddress(value)).join(', ')}`,
+                    0
+                  )
+                }
+              }
+
+              const focusedCandidate = this.findVerifiedCandidateViaFocusedContactSingleCore(
+                ReadProcessMemory,
+                hProcess,
+                entry.address,
+                sharedChildren,
+                verifyKey,
+                seenCandidates,
+                onStatus
+              )
+              if (focusedCandidate) return focusedCandidate
+            }
+          }
+        }
+      }
+    return null
+  }
+
+  private traceFocusedContactChildren(
+    ReadProcessMemory: any,
+    hProcess: any,
+    address: number,
+    buffer: Buffer,
+    graph: Map<number, Set<number>> | null,
+    onStatus?: (message: string, level: number) => void
+  ) {
+    if (!onStatus || !this.shouldTraceFocusedContactEntry(address)) return
+
+    const childPointers = this.collectFilteredChildPointers(buffer, 8)
+    const preview = childPointers.map((value) => this.formatProcessAddress(value)).join(', ')
+    onStatus(`Native scan: [contact.db] focused children ${this.formatProcessAddress(address)} -> ${preview}`, 0)
+
+    for (const child of childPointers.slice(0, 6)) {
+      const childBuffer = this.readProcessBuffer(ReadProcessMemory, hProcess, child, 0x60)
+      if (!childBuffer || childBuffer.length < 32) continue
+
+      onStatus(`Native scan: [contact.db] child ${this.formatProcessAddress(child)} ${this.summarizeNodeHead(childBuffer)}`, 0)
+      this.traceFocusedContactOwnerChildren(ReadProcessMemory, hProcess, child, childBuffer, graph, onStatus)
+    }
+  }
+
+  private traceFocusedContactOwnerChildren(
+    ReadProcessMemory: any,
+    hProcess: any,
+    address: number,
+    buffer: Buffer,
+    graph: Map<number, Set<number>> | null,
+    onStatus?: (message: string, level: number) => void
+  ) {
+    if (!onStatus || !this.shouldTraceFocusedContactOwner(address)) return
+
+    const childPointers = this.collectFilteredChildPointers(buffer, 8)
+    const preview = childPointers.map((value) => this.formatProcessAddress(value)).join(', ')
+    onStatus(`Native scan: [contact.db] owner children ${this.formatProcessAddress(address)} -> ${preview}`, 0)
+
+    for (const child of childPointers.slice(0, 6)) {
+      const childBuffer = this.readProcessBuffer(ReadProcessMemory, hProcess, child, 0x60)
+      if (!childBuffer || childBuffer.length < 32) continue
+
+      onStatus(`Native scan: [contact.db] owner child ${this.formatProcessAddress(child)} ${this.summarizeNodeHead(childBuffer)}`, 0)
+      if (graph && this.shouldCollectFocusedContactHub(child)) {
+        this.appendContactHubGraph(graph, child, this.collectFilteredChildPointers(childBuffer, 8))
+      }
+    }
+  }
+
+  private verifyCandidateFromSlice(
+    buffer: Buffer,
+    offset: number,
+    verifyKey: (candidate: string) => boolean,
+    seenCandidates: Set<string>
+  ): string | null {
+    if (offset < 0 || offset + 32 > buffer.length) return null
+    const candidate = buffer.subarray(offset, offset + 32).toString('hex')
+    if (seenCandidates.has(candidate)) return null
+    seenCandidates.add(candidate)
+    return verifyKey(candidate) ? candidate : null
+  }
+
+  private findVerifiedCandidateViaSiblingFields(
+    ReadProcessMemory: any,
+    hProcess: any,
+    rootSeeds: number[],
+    verifyKey: (candidate: string) => boolean,
+    seenCandidates: Set<string>,
+    targetName?: string,
+    onStatus?: (message: string, level: number) => void
+  ): string | null {
+    const STRUCT_WINDOW_SIZE = 0x240
+    const STRUCT_POINTER_LIMIT = 24
+    const SECOND_HOP_POINTER_LIMIT = 12
+    const focusedContactHubGraph = targetName === 'contact.db' ? new Map<number, Set<number>>() : null
+    const baseCandidates = Array.from(new Set(
+      rootSeeds.flatMap((seed) =>
+        [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128]
+          .map((delta) => seed - delta)
+          .filter((addr) => this.isLikelyProcessAddress(addr))
+      )
+    )).slice(0, 40)
+    const directOffsets = [
+      0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48,
+      0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88,
+      0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0, 0xc8
+    ]
+    const pointedOffsets = [0, 8, 16, 24, 32, 40, 48, 56]
+    const seenPointers = new Set<number>()
+    let traceBudget = 18
+    const trace = (stage: string, address: number, extra?: string) => {
+      if (!targetName || !onStatus || traceBudget <= 0) return
+      traceBudget--
+      onStatus(`Native scan: [${targetName}] ${stage} ${this.formatProcessAddress(address)}${extra ? ` ${extra}` : ''}`, 0)
+    }
+
+    if (targetName && onStatus && baseCandidates.length > 0) {
+      const preview = baseCandidates.slice(0, 6).map((value) => this.formatProcessAddress(value)).join(', ')
+      onStatus(`Native scan: [${targetName}] structure seeds ${preview}${baseCandidates.length > 6 ? ' ...' : ''}`, 0)
+    }
+
+    for (const base of baseCandidates) {
+      trace('base', base)
+      const window = this.readProcessBuffer(ReadProcessMemory, hProcess, base, STRUCT_WINDOW_SIZE)
+      if (!window || window.length < 64) continue
+      this.traceDetailedLayout(targetName ?? '', 'base', base, window, onStatus)
+
+      for (const offset of directOffsets) {
+        const candidate = this.verifyCandidateFromSlice(window, offset, verifyKey, seenCandidates)
+        if (candidate) return candidate
+      }
+
+      for (const pointer of this.extractPointerValues(window, STRUCT_POINTER_LIMIT)) {
+        if (seenPointers.has(pointer)) continue
+        seenPointers.add(pointer)
+        trace('sibling', pointer)
+
+        const pointed = this.readProcessBuffer(
+          ReadProcessMemory,
+          hProcess,
+          pointer,
+          this.getDetailedLayoutReadSize(targetName ?? '', pointer, 160)
+        )
+        if (!pointed || pointed.length < 32) continue
+        this.traceDetailedLayout(targetName ?? '', 'sibling', pointer, pointed, onStatus)
+
+        for (const offset of pointedOffsets) {
+          const candidate = this.verifyCandidateFromSlice(pointed, offset, verifyKey, seenCandidates)
+          if (candidate) return candidate
+        }
+
+        const pointedCandidate = this.findVerifiedCandidateInBuffer(pointed, verifyKey, seenCandidates, {
+          rawStep: 8,
+          maxRawCandidates: 12
+        })
+        if (pointedCandidate) return pointedCandidate
+
+        for (const secondHopPointer of this.extractPointerValues(pointed, SECOND_HOP_POINTER_LIMIT)) {
+          if (seenPointers.has(secondHopPointer)) continue
+          seenPointers.add(secondHopPointer)
+          trace('second-hop', secondHopPointer, `via ${this.formatProcessAddress(pointer)}`)
+
+          const secondHop = this.readProcessBuffer(
+            ReadProcessMemory,
+            hProcess,
+            secondHopPointer,
+            this.getDetailedLayoutReadSize(targetName ?? '', secondHopPointer, 96)
+          )
+          if (!secondHop || secondHop.length < 32) continue
+          this.traceDetailedLayout(targetName ?? '', 'second-hop', secondHopPointer, secondHop, onStatus)
+          if ((targetName ?? '') === 'contact.db') {
+            this.traceFocusedContactChildren(ReadProcessMemory, hProcess, secondHopPointer, secondHop, focusedContactHubGraph, onStatus)
+            this.traceFocusedContactOwnerChildren(ReadProcessMemory, hProcess, secondHopPointer, secondHop, focusedContactHubGraph, onStatus)
+          }
+
+          for (const offset of pointedOffsets) {
+            const candidate = this.verifyCandidateFromSlice(secondHop, offset, verifyKey, seenCandidates)
+            if (candidate) return candidate
+          }
+
+          const secondHopCandidate = this.findVerifiedCandidateInBuffer(secondHop, verifyKey, seenCandidates, {
+            rawStep: 8,
+            maxRawCandidates: 8
+          })
+          if (secondHopCandidate) return secondHopCandidate
+        }
+      }
+    }
+
+    if ((targetName ?? '') === 'contact.db') {
+      const focusedCandidate = this.traceSharedContactHubCandidates(
+        ReadProcessMemory,
+        hProcess,
+        focusedContactHubGraph ?? new Map<number, Set<number>>(),
+        verifyKey,
+        seenCandidates,
+        onStatus
+      )
+      if (focusedCandidate) return focusedCandidate
+    }
+
+    return null
+  }
+
+  private applyMatchedCandidateAcrossTargets(
+    candidate: string,
+    targets: DbVerificationTarget[],
+    matchedKeys: Record<string, string>,
+    verifiers: Map<string, (candidate: string) => boolean>,
+    onStatus?: (message: string, level: number) => void
+  ) {
+    for (const target of targets) {
+      if (matchedKeys[target.saltHex]) continue
+      const verifyKey = verifiers.get(target.saltHex) ?? this.createBestDbKeyVerifier(target.path)
+      if (!verifyKey) continue
+      verifiers.set(target.saltHex, verifyKey)
+      if (!verifyKey(candidate)) continue
+      matchedKeys[target.saltHex] = candidate
+      onStatus?.(`Native scan: matched ${target.name} via shared candidate reuse`, 1)
+    }
+  }
+
+  private async scanProcessForMarkerAnchors(
+    ReadProcessMemory: any,
+    hProcess: any,
+    regions: Array<[number, number]>,
+    targets: DbVerificationTarget[],
+    onStatus?: (message: string, level: number) => void
+  ): Promise<Map<string, number[]>> {
+    const CHUNK_SIZE = 1024 * 1024
+    const OVERLAP = Math.max(...targets.flatMap((target) => target.markers.map((marker) => Buffer.from(marker, 'utf16le').length)), 64)
+    const MAX_HITS_PER_TARGET = 6
+    const anchorMap = new Map<string, number[]>()
+    const markerEntries = targets.flatMap((target) =>
+      target.markers.map((marker) => ({
+        target,
+        buffer: Buffer.from(marker, 'utf16le')
+      })).filter((entry) => entry.buffer.length > 0)
+    )
+
+    for (let regionIndex = 0; regionIndex < regions.length; regionIndex++) {
+      if (
+        anchorMap.size >= targets.length &&
+        Array.from(anchorMap.values()).every((hits) => hits.length >= MAX_HITS_PER_TARGET)
+      ) {
+        break
+      }
+      const [base, size] = regions[regionIndex]
+      if (regionIndex > 0 && regionIndex % 32 === 0) {
+        onStatus?.(`Native scan: marker-anchor progress ${regionIndex}/${regions.length}`, 0)
+        await new Promise((resolve) => setTimeout(resolve, 1))
+      }
+
+      let offset = 0
+      let trailing = Buffer.alloc(0)
+      while (offset < size) {
+        const bytesToRead = Math.min(CHUNK_SIZE, size - offset)
+        const chunk = this.readProcessBuffer(ReadProcessMemory, hProcess, base + offset, bytesToRead)
+        if (!chunk || chunk.length === 0) {
+          offset += bytesToRead
+          trailing = Buffer.alloc(0)
+          continue
+        }
+
+        const haystack = trailing.length > 0 ? Buffer.concat([trailing, chunk]) : chunk
+        const haystackBase = base + offset - trailing.length
+
+        for (const { target, buffer } of markerEntries) {
+          const existing = anchorMap.get(target.saltHex) ?? []
+          if (existing.length >= MAX_HITS_PER_TARGET) continue
+          const hitIndex = haystack.indexOf(buffer)
+          if (hitIndex === -1) continue
+
+          const anchorAddress = haystackBase + hitIndex
+          const derivedAnchors = [0, 8, 16, 24, 32, 40, 48, 56, 64]
+            .map((delta) => anchorAddress - delta)
+            .filter((addr) => this.isLikelyProcessAddress(addr))
+
+          for (const candidate of derivedAnchors) {
+            if (!existing.includes(candidate)) {
+              existing.push(candidate)
+            }
+            if (existing.length >= MAX_HITS_PER_TARGET) break
+          }
+          anchorMap.set(target.saltHex, existing)
+        }
+
+        trailing = Buffer.from(haystack.subarray(Math.max(0, haystack.length - OVERLAP)))
+        offset += chunk.length
+      }
+    }
+
+    return anchorMap
+  }
+
+  private async scanProcessForPointerReferences(
+    ReadProcessMemory: any,
+    hProcess: any,
+    regions: Array<[number, number]>,
+    anchorMap: Map<string, number[]>,
+    onStatus?: (message: string, level: number) => void
+  ): Promise<Map<string, number[]>> {
+    const CHUNK_SIZE = 1024 * 1024
+    const refsBySalt = new Map<string, number[]>()
+    const patternEntries = Array.from(anchorMap.entries()).flatMap(([saltHex, anchors]) =>
+      anchors.map((anchor) => ({
+        saltHex,
+        anchor,
+        pattern: Buffer.from(BigInt(anchor).toString(16).padStart(16, '0'), 'hex').reverse()
+      }))
+    )
+    const MAX_REFS_PER_TARGET = 8
+
+    const targetSaltCount = new Set(patternEntries.map((entry) => entry.saltHex)).size
+
+    for (let regionIndex = 0; regionIndex < regions.length; regionIndex++) {
+      if (
+        targetSaltCount > 0 &&
+        refsBySalt.size >= targetSaltCount &&
+        Array.from(refsBySalt.values()).every((refs) => refs.length >= MAX_REFS_PER_TARGET)
+      ) {
+        break
+      }
+      const [base, size] = regions[regionIndex]
+      if (regionIndex > 0 && regionIndex % 32 === 0) {
+        onStatus?.(`Native scan: reverse-pointer progress ${regionIndex}/${regions.length}`, 0)
+        await new Promise((resolve) => setTimeout(resolve, 1))
+      }
+
+      let offset = 0
+      let trailing = Buffer.alloc(0)
+      while (offset < size) {
+        const bytesToRead = Math.min(CHUNK_SIZE, size - offset)
+        const chunk = this.readProcessBuffer(ReadProcessMemory, hProcess, base + offset, bytesToRead)
+        if (!chunk || chunk.length === 0) {
+          offset += bytesToRead
+          trailing = Buffer.alloc(0)
+          continue
+        }
+
+        const haystack = trailing.length > 0 ? Buffer.concat([trailing, chunk]) : chunk
+        const haystackBase = base + offset - trailing.length
+
+        for (const { saltHex, pattern } of patternEntries) {
+          const refs = refsBySalt.get(saltHex) ?? []
+          if (refs.length >= MAX_REFS_PER_TARGET) continue
+
+          let searchStart = 0
+          while (searchStart < haystack.length) {
+            const hitIndex = haystack.indexOf(pattern, searchStart)
+            if (hitIndex === -1) break
+            const refAddress = haystackBase + hitIndex
+            if (!refs.includes(refAddress)) {
+              refs.push(refAddress)
+              refsBySalt.set(saltHex, refs)
+            }
+            searchStart = hitIndex + 8
+            if (refs.length >= MAX_REFS_PER_TARGET) break
+          }
+        }
+
+        trailing = Buffer.from(haystack.subarray(Math.max(0, haystack.length - 8)))
+        offset += chunk.length
+      }
+    }
+
+    return refsBySalt
+  }
+
+  private findVerifiedCandidateViaPointerGraph(
+    ReadProcessMemory: any,
+    hProcess: any,
+    rootRefs: number[],
+    verifyKey: (candidate: string) => boolean,
+    seenCandidates: Set<string>
+  ): string | null {
+    const MAX_DEPTH = 3
+    const MAX_NODES = 64
+    const NODE_WINDOW_BEFORE = 64
+    const NODE_WINDOW_SIZE = 320
+    const queue: Array<{ address: number; depth: number }> = rootRefs.map((address) => ({ address, depth: 0 }))
+    const seenNodes = new Set<number>()
+    const seenPointers = new Set<number>()
+
+    while (queue.length > 0 && seenNodes.size < MAX_NODES) {
+      const current = queue.shift()!
+      if (!this.isLikelyProcessAddress(current.address) || seenNodes.has(current.address)) continue
+      seenNodes.add(current.address)
+
+      const windowStart = Math.max(0, current.address - NODE_WINDOW_BEFORE)
+      const window = this.readProcessBuffer(ReadProcessMemory, hProcess, windowStart, NODE_WINDOW_SIZE)
+      if (!window || window.length < 32) continue
+
+      const directCandidate = this.findVerifiedCandidateInBuffer(window, verifyKey, seenCandidates, {
+        rawStep: 8,
+        maxRawCandidates: 48
+      })
+      if (directCandidate) return directCandidate
+
+      const pointerCandidate = this.findVerifiedCandidateViaPointers(
+        ReadProcessMemory,
+        hProcess,
+        window,
+        verifyKey,
+        seenCandidates,
+        seenPointers
+      )
+      if (pointerCandidate) return pointerCandidate
+
+      if (current.depth >= MAX_DEPTH) continue
+
+      for (const pointer of this.extractPointerValues(window, 24)) {
+        if (!seenNodes.has(pointer)) {
+          queue.push({ address: pointer, depth: current.depth + 1 })
+        }
+      }
+    }
+
+    return null
+  }
+
+  private async collectDbVerificationTargets(): Promise<DbVerificationTarget[]> {
+    try {
+      const detected = await dbPathService.autoDetect()
+      if (!detected.success || !detected.path) return []
+
+      const wxids = dbPathService.scanWxids(detected.path)
+      if (wxids.length === 0) return []
+
+      const wxid = wxids[0].wxid
+      const dbStoragePath = join(detected.path, wxid, 'db_storage')
+      if (!existsSync(dbStoragePath)) return []
+
+      const targetRelativePaths = [
+        ['session.db', join('session', 'session.db')],
+        ['contact.db', join('contact', 'contact.db')],
+        ['message_0.db', join('message', 'message_0.db')],
+        ['biz_message_0.db', join('message', 'biz_message_0.db')],
+        ['message_fts.db', join('message', 'message_fts.db')],
+        ['message_resource.db', join('message', 'message_resource.db')],
+        ['sns.db', join('sns', 'sns.db')]
+      ] as const
+
+      const { readFileSync } = require('fs') as typeof import('fs')
+      const targets: DbVerificationTarget[] = []
+      for (const [name, relativePath] of targetRelativePaths) {
+        const fullPath = join(dbStoragePath, relativePath)
+        if (!existsSync(fullPath)) continue
+        try {
+          const head = readFileSync(fullPath).subarray(0, 16)
+          if (head.length < 16) continue
+          const saltHex = head.toString('hex')
+          if (/^53514c697465/i.test(saltHex)) continue
+          targets.push({
+            name,
+            path: fullPath,
+            saltHex,
+            markers: this.collectDbMarkerTexts(fullPath, relativePath)
+          })
+        } catch { }
+      }
+      return targets
+    } catch {
+      return []
+    }
+  }
+
+  private async scanProcessForHexKeys(
+    pid: number,
+    onStatus?: (message: string, level: number) => void
+  ): Promise<string[]> {
+    if (!this.ensureKernel32()) return []
+    this.koffi = this.koffi || require('koffi')
+
+    const VirtualQueryEx = this.kernel32.func('VirtualQueryEx', 'size_t', ['void*', 'uintptr', 'void*', 'size_t'])
+    const ReadProcessMemory = this.kernel32.func('ReadProcessMemory', 'bool', ['void*', 'uintptr', 'void*', 'size_t', this.koffi.out('size_t*')])
+
+    const PROCESS_QUERY_INFORMATION = 0x0400
+    const PROCESS_VM_READ = 0x0010
+    const RW_FLAGS = 0x04 | 0x08 | 0x40 | 0x80
+    const MEM_COMMIT = 0x1000
+    const PAGE_NOACCESS = 0x01
+    const PAGE_GUARD = 0x100
+    const MBI_SIZE = 48
+    const CHUNK_SIZE = 2 * 1024 * 1024
+    const OVERLAP = 127
+    const MAX_REGION_SIZE = 64 * 1024 * 1024
+    const MAX_CANDIDATES = 2048
+    const candidateSet = new Set<string>()
+    const hexPattern = /(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])/g
+    const utf16HexPattern = /(?:[0-9a-fA-F]\x00){64}/g
+
+    const hProcess = this.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
+    if (!hProcess) return []
+
+    try {
+      const regions: Array<[number, number]> = []
+      let address = 0
+      const mbi = Buffer.alloc(MBI_SIZE)
+
+      while (address < 0x7fffffffffff) {
+        const ret = VirtualQueryEx(hProcess, address, mbi, MBI_SIZE)
+        if (ret === 0) break
+
+        const base = Number(mbi.readBigUInt64LE(0))
+        const size = Number(mbi.readBigUInt64LE(24))
+        const state = mbi.readUInt32LE(32)
+        const protect = mbi.readUInt32LE(36)
+
+        if (
+          state === MEM_COMMIT &&
+          protect !== PAGE_NOACCESS &&
+          (protect & PAGE_GUARD) === 0 &&
+          (protect & RW_FLAGS) !== 0 &&
+          size > 0 &&
+          size <= MAX_REGION_SIZE
+        ) {
+          regions.push([base, size])
+        }
+
+        const next = base + size
+        if (next <= address) break
+        address = next
+      }
+
+      onStatus?.(`Native scan: scanning ${regions.length} readable memory regions`, 0)
+
+      for (let regionIndex = 0; regionIndex < regions.length; regionIndex++) {
+        if (candidateSet.size >= MAX_CANDIDATES) break
+        const [base, size] = regions[regionIndex]
+        if (regionIndex > 0 && regionIndex % 32 === 0) {
+          onStatus?.(`Native scan: memory region progress ${regionIndex}/${regions.length}`, 0)
+          await new Promise((resolve) => setTimeout(resolve, 1))
+        }
+
+        let offset = 0
+        let trailing = ''
+        while (offset < size && candidateSet.size < MAX_CANDIDATES) {
+          const bytesToRead = Math.min(CHUNK_SIZE, size - offset)
+          const chunk = Buffer.alloc(bytesToRead)
+          const bytesRead = Buffer.alloc(8)
+          const ok = ReadProcessMemory(hProcess, base + offset, chunk, bytesToRead, bytesRead)
+          if (!ok) {
+            offset += bytesToRead
+            trailing = ''
+            continue
+          }
+
+          const actualBytes = Number(bytesRead.readBigUInt64LE(0))
+          if (actualBytes <= 0) {
+            offset += bytesToRead
+            trailing = ''
+            continue
+          }
+
+          const current = chunk.subarray(0, actualBytes).toString('latin1')
+          const haystack = trailing + current
+          for (const match of haystack.match(hexPattern) ?? []) {
+            candidateSet.add(match.toLowerCase())
+            if (candidateSet.size >= MAX_CANDIDATES) break
+          }
+          if (candidateSet.size < MAX_CANDIDATES) {
+            for (const match of haystack.match(utf16HexPattern) ?? []) {
+              candidateSet.add(match.replace(/\x00/g, '').toLowerCase())
+              if (candidateSet.size >= MAX_CANDIDATES) break
+            }
+          }
+
+          trailing = haystack.slice(Math.max(0, haystack.length - OVERLAP))
+          offset += actualBytes
+        }
+      }
+
+      return Array.from(candidateSet)
+    } finally {
+      this.CloseHandle(hProcess)
+    }
+  }
+
+  private async scanProcessForKeysNearDbMarkers(
+    pid: number,
+    targets: DbVerificationTarget[],
+    onStatus?: (message: string, level: number) => void
+  ): Promise<Record<string, string>> {
+    if (!this.ensureKernel32() || targets.length === 0) return {}
+    this.koffi = this.koffi || require('koffi')
+
+    const VirtualQueryEx = this.kernel32.func('VirtualQueryEx', 'size_t', ['void*', 'uintptr', 'void*', 'size_t'])
+    const ReadProcessMemory = this.kernel32.func('ReadProcessMemory', 'bool', ['void*', 'uintptr', 'void*', 'size_t', this.koffi.out('size_t*')])
+
+    const PROCESS_QUERY_INFORMATION = 0x0400
+    const PROCESS_VM_READ = 0x0010
+    const RW_FLAGS = 0x04 | 0x08 | 0x40 | 0x80
+    const MAX_REGION_SIZE = 64 * 1024 * 1024
+    const verifiers = new Map<string, (candidate: string) => boolean>()
+    const matchedKeys: Record<string, string> = {}
+
+    const hProcess = this.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
+    if (!hProcess) return {}
+
+    try {
+      const regions = this.collectReadableProcessRegions(VirtualQueryEx, hProcess, RW_FLAGS, MAX_REGION_SIZE)
+      onStatus?.(`Native scan: probing ${targets.length} DB path/file markers in writable memory`, 0)
+      const anchorMap = await this.scanProcessForMarkerAnchors(ReadProcessMemory, hProcess, regions, targets, onStatus)
+      onStatus?.(`Native scan: collected ${Array.from(anchorMap.values()).reduce((sum, hits) => sum + hits.length, 0)} anchor candidates for ${anchorMap.size}/${targets.length} DB samples`, 0)
+      const refMap = await this.scanProcessForPointerReferences(ReadProcessMemory, hProcess, regions, anchorMap, onStatus)
+      onStatus?.(`Native scan: collected ${Array.from(refMap.values()).reduce((sum, refs) => sum + refs.length, 0)} reverse-pointer hits for ${refMap.size}/${targets.length} DB samples`, 0)
+
+      for (const target of targets) {
+        const refs = refMap.get(target.saltHex) ?? []
+        if (refs.length === 0) continue
+
+        const verifyKey = verifiers.get(target.saltHex) ?? this.createBestDbKeyVerifier(target.path)
+        if (!verifyKey) continue
+        verifiers.set(target.saltHex, verifyKey)
+
+        const rootSeeds = Array.from(new Set(
+          refs.flatMap((ref) =>
+            [0, 8, 16, 24, 32, 40, 48, 56, 64]
+              .map((delta) => ref - delta)
+              .filter((addr) => this.isLikelyProcessAddress(addr))
+          )
+        ))
+        onStatus?.(
+          `Native scan: [${target.name}] refs ${refs.slice(0, 4).map((value) => this.formatProcessAddress(value)).join(', ')}; root seeds ${rootSeeds.length}`,
+          0
+        )
+
+        const seenCandidates = new Set<string>()
+
+        const candidate = this.findVerifiedCandidateViaSiblingFields(
+          ReadProcessMemory,
+          hProcess,
+          rootSeeds,
+          verifyKey,
+          seenCandidates,
+          target.name,
+          onStatus
+        ) ?? this.findVerifiedCandidateViaPointerGraph(
+          ReadProcessMemory,
+          hProcess,
+          rootSeeds,
+          verifyKey,
+          seenCandidates
+        )
+        if (candidate) {
+          matchedKeys[target.saltHex] = candidate
+          onStatus?.(`Native scan: matched ${target.name} via path-anchor structure scan`, 1)
+          this.applyMatchedCandidateAcrossTargets(candidate, targets, matchedKeys, verifiers, onStatus)
+          if (Object.keys(matchedKeys).length === targets.length) {
+            break
+          }
+        }
+      }
+
+      return matchedKeys
+    } finally {
+      this.CloseHandle(hProcess)
+    }
+  }
+
+  private async scanProcessForRawWcdbKeyStrings(
+    pid: number,
+    targets: DbVerificationTarget[],
+    onStatus?: (message: string, level: number) => void
+  ): Promise<Record<string, string>> {
+    if (!this.ensureKernel32() || targets.length === 0) return {}
+    this.koffi = this.koffi || require('koffi')
+
+    const VirtualQueryEx = this.kernel32.func('VirtualQueryEx', 'size_t', ['void*', 'uintptr', 'void*', 'size_t'])
+    const ReadProcessMemory = this.kernel32.func('ReadProcessMemory', 'bool', ['void*', 'uintptr', 'void*', 'size_t', this.koffi.out('size_t*')])
+
+    const PROCESS_QUERY_INFORMATION = 0x0400
+    const PROCESS_VM_READ = 0x0010
+    const RW_FLAGS = 0x04 | 0x08 | 0x40 | 0x80
+    const MAX_REGION_SIZE = 64 * 1024 * 1024
+    const CHUNK_SIZE = 2 * 1024 * 1024
+    const OVERLAP = 160
+    const matchedKeys: Record<string, string> = {}
+
+    const targetStates = targets.map((target) => ({
+      target,
+      verifyKey: this.createSqlcipher4RawKeyVerifier(target.path),
+      seenCandidates: new Set<string>(),
+      pattern: new RegExp(`(?:x')?([0-9a-fA-F]{64})${target.saltHex}(?:')?`, 'ig')
+    })).filter((entry) => Boolean(entry.verifyKey))
+
+    if (targetStates.length === 0) return {}
+
+    const hProcess = this.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
+    if (!hProcess) return {}
+
+    try {
+      const regions = this.collectReadableProcessRegions(VirtualQueryEx, hProcess, RW_FLAGS, MAX_REGION_SIZE)
+      onStatus?.(`Native scan: trying SQLCipher4 raw-key markers across ${targetStates.length} DB salts`, 0)
+
+      for (let regionIndex = 0; regionIndex < regions.length; regionIndex++) {
+        if (Object.keys(matchedKeys).length === targetStates.length) break
+        const [base, size] = regions[regionIndex]
+        if (regionIndex > 0 && regionIndex % 32 === 0) {
+          onStatus?.(`Native scan: raw-key marker progress ${regionIndex}/${regions.length}`, 0)
+          await new Promise((resolve) => setTimeout(resolve, 1))
+        }
+
+        let offset = 0
+        let trailing = ''
+        while (offset < size && Object.keys(matchedKeys).length < targetStates.length) {
+          const bytesToRead = Math.min(CHUNK_SIZE, size - offset)
+          const chunk = this.readProcessBuffer(ReadProcessMemory, hProcess, base + offset, bytesToRead)
+          if (!chunk || chunk.length === 0) {
+            offset += bytesToRead
+            trailing = ''
+            continue
+          }
+
+          const haystack = trailing + chunk.toString('latin1')
+          for (const entry of targetStates) {
+            const { target, verifyKey, seenCandidates, pattern } = entry
+            if (!verifyKey || matchedKeys[target.saltHex]) continue
+            pattern.lastIndex = 0
+            let match: RegExpExecArray | null = null
+            while ((match = pattern.exec(haystack)) !== null) {
+              const candidate = String(match[1] || '').toLowerCase()
+              if (!this.isHexKey(candidate) || seenCandidates.has(candidate)) continue
+              seenCandidates.add(candidate)
+              if (!verifyKey(candidate)) continue
+              matchedKeys[target.saltHex] = candidate
+              onStatus?.(`Native scan: matched ${target.name} via raw wcdb key marker`, 1)
+              break
+            }
+          }
+
+          trailing = haystack.slice(Math.max(0, haystack.length - OVERLAP))
+          offset += chunk.length
+        }
+      }
+
+      return matchedKeys
+    } finally {
+      this.CloseHandle(hProcess)
+    }
+  }
+
   private async _getDbKeyViaPyWxDump(
     onStatus?: (message: string, level: number) => void
   ): Promise<DbKeyResult> {
@@ -626,39 +2263,288 @@ export class KeyService {
       return { success: false, error: result.error || 'PyWxDump 未返回任何账号信息' }
     }
 
-    // 优先找有 wcdb_keys 或 key 的账号，而非固定取第一个（同一 wxid 可能有多个进程）
     const account = result.accounts.find((a: any) =>
       (a.wcdb_keys && Object.keys(a.wcdb_keys).length > 0) ||
       (a.key && a.key.length === 64)
     ) ?? result.accounts[0]
 
-    // 新版 Weixin 4.x：有 wcdb_keys（每个 DB 独立密钥）
     if (account.wcdb_keys && Object.keys(account.wcdb_keys).length > 0) {
-      onStatus?.('检测到新版 Weixin 4.x，使用多密钥模式', 1)
-      return {
-        success: true,
-        wcdbKeys: account.wcdb_keys,
-        source: 'pywxdump',
-      }
+      onStatus?.('PyWxDump returned Weixin 4.x multi-key result', 1)
+      return { success: true, wcdbKeys: account.wcdb_keys, source: 'pywxdump' }
     }
 
-    // 旧版 WeChat 3.x：单一 64位 hex key
-    if (account.key && account.key.length === 64) {
-      onStatus?.('密钥获取成功（PyWxDump）', 1)
-      return {
-        success: true,
-        key: account.key,
-        source: 'pywxdump',
-      }
+    if (account.key && this.isHexKey(account.key)) {
+      onStatus?.('PyWxDump returned a usable DB key', 1)
+      return { success: true, key: String(account.key).trim().toLowerCase(), source: 'pywxdump' }
     }
 
     return { success: false, error: 'PyWxDump 返回的密钥格式无效' }
   }
 
-  // --- Image Key (通过 DLL 从缓存目录获取 code，用前端 wxid 计算密钥) ---
+  private async _getDbKeyViaNativeMemoryScan(
+    onStatus?: (message: string, level: number) => void,
+    targetOverride?: DbVerificationTarget[],
+    allowPartial = false
+  ): Promise<DbKeyResult> {
+    const targets = targetOverride && targetOverride.length > 0
+      ? targetOverride
+      : await this.collectDbVerificationTargets()
+    if (targets.length === 0) {
+      return { success: false, error: '自有内存扫描未找到可用于校验的数据库样本' }
+    }
+
+    const pid = await this.findWeChatPid()
+    if (!pid) {
+      return { success: false, error: '未检测到微信进程，请先启动并登录微信' }
+    }
+
+    onStatus?.(`Native scan: found ${targets.length} encrypted DB samples`, 0)
+    const matchedKeys = await this.scanProcessForRawWcdbKeyStrings(pid, targets, onStatus)
+    if (Object.keys(matchedKeys).length > 0) {
+      onStatus?.(`Native scan: raw wcdb key markers covered ${Object.keys(matchedKeys).length}/${targets.length} DB samples`, 0)
+    }
+
+    const remainingAfterRaw = targets.filter((target) => !matchedKeys[target.saltHex])
+    if (remainingAfterRaw.length > 0) {
+      const markerMatchedKeys = await this.scanProcessForKeysNearDbMarkers(pid, remainingAfterRaw, onStatus)
+      Object.assign(matchedKeys, markerMatchedKeys)
+    }
+
+    if (Object.keys(matchedKeys).length !== targets.length) {
+      const candidates = await this.scanProcessForHexKeys(pid, onStatus)
+      if (candidates.length === 0 && Object.keys(matchedKeys).length === 0) {
+        return { success: false, error: '自有内存扫描未找到可用密钥候选（ASCII / raw）' }
+      }
+
+      if (candidates.length > 0) {
+        onStatus?.(`Native scan: verifying ${candidates.length} global ASCII candidates`, 0)
+      }
+
+      for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+        const candidate = candidates[candidateIndex]
+        if (candidateIndex > 0 && candidateIndex % 128 === 0) {
+          onStatus?.(`Native scan: global candidate progress ${candidateIndex}/${candidates.length}`, 0)
+          await new Promise((resolve) => setTimeout(resolve, 1))
+        }
+
+        for (const target of targets) {
+          if (matchedKeys[target.saltHex]) continue
+          const verifyKey = this.createBestDbKeyVerifier(target.path)
+          if (!verifyKey || !verifyKey(candidate)) continue
+          matchedKeys[target.saltHex] = candidate
+          onStatus?.(`Native scan: matched ${target.name}`, 1)
+        }
+
+        if (Object.keys(matchedKeys).length === targets.length) break
+      }
+    }
+
+    if (Object.keys(matchedKeys).length !== targets.length) {
+      if (allowPartial && Object.keys(matchedKeys).length > 0) {
+        onStatus?.(`Native scan: partial coverage ${Object.keys(matchedKeys).length}/${targets.length}`, 1)
+        return { success: true, wcdbKeys: matchedKeys, source: 'native' }
+      }
+      return {
+        success: false,
+        error: `自有内存扫描仅覆盖 ${Object.keys(matchedKeys).length}/${targets.length} 个数据库样本，暂时无法完全替代 DLL`,
+        logs: targets
+          .filter((target) => matchedKeys[target.saltHex])
+          .map((target) => `已命中 ${target.name}`)
+      }
+    }
+
+    if (allowPartial) {
+      onStatus?.(`Native scan: supplemented ${Object.keys(matchedKeys).length} DB salts`, 1)
+      return { success: true, wcdbKeys: matchedKeys, source: 'native' }
+    }
+
+    const uniqueKeys = Array.from(new Set(Object.values(matchedKeys)))
+    if (uniqueKeys.length === 1) {
+      onStatus?.('Native scan: key extraction succeeded in single-key mode', 1)
+      return { success: true, key: uniqueKeys[0], source: 'native' }
+    }
+
+    onStatus?.(`Native scan: key extraction succeeded in multi-key mode (${uniqueKeys.length})`, 1)
+    return { success: true, wcdbKeys: matchedKeys, source: 'native' }
+  }
+
+  private async supplementWcdbKeysIfNeeded(
+    currentKeys: Record<string, string>,
+    onStatus?: (message: string, level: number) => void
+  ): Promise<Record<string, string>> {
+    const normalizedKeys = this.normalizeWcdbKeys(currentKeys) ?? {}
+    const targets = await this.collectDbVerificationTargets()
+    if (targets.length === 0) return normalizedKeys
+
+    const missingTargets = targets.filter((target) => !normalizedKeys[target.saltHex])
+    if (missingTargets.length === 0) return normalizedKeys
+
+    onStatus?.(
+      `PyWxDump covered ${Object.keys(normalizedKeys).length}/${targets.length} DB samples; supplementing ${missingTargets.length} missing salts via native scan`,
+      0
+    )
+
+    const nativeResult = await this._getDbKeyViaNativeMemoryScan(onStatus, missingTargets, true)
+    const nativeKeys = this.normalizeWcdbKeys(nativeResult.wcdbKeys)
+    if (!nativeResult.success || !nativeKeys) {
+      onStatus?.('Native supplement did not recover additional WCDB salts', 1)
+      return normalizedKeys
+    }
+
+    const mergedKeys = { ...normalizedKeys, ...nativeKeys }
+    onStatus?.(
+      `Native supplement recovered ${Object.keys(nativeKeys).length} salts; coverage ${Object.keys(mergedKeys).length}/${targets.length}`,
+      Object.keys(mergedKeys).length === targets.length ? 1 : 0
+    )
+    return mergedKeys
+  }
+
+  private async _getDbKeyViaDll(
+    timeoutMs: number,
+    onStatus?: (message: string, level: number) => void
+  ): Promise<DbKeyResult> {
+    if (!this.ensureLoaded()) return { success: false, error: 'wx_key.dll 未加载' }
+    if (!this.ensureKernel32()) return { success: false, error: 'Kernel32 init failed' }
+
+    const pid = await this.findWeChatPid()
+    if (!pid) {
+      return { success: false, error: '未找到微信进程，请先启动微信' }
+    }
+
+    onStatus?.(`DLL fallback: attaching to pid ${pid}`, 0)
+    const loginRequiredBefore = await this.detectWeChatLoginRequired(pid)
+    const readyBefore = await this.waitForWeChatWindowComponents(pid, 1500)
+
+    const initOk = this.initHook(pid)
+    if (!initOk) {
+      const dllError = this.getLastErrorMsg ? this.decodeCString(this.getLastErrorMsg()) : ''
+      if (dllError.includes('0xC0000022') || dllError.includes('ACCESS_DENIED')) {
+        return { success: false, error: '权限不足：无法访问微信进程，请尝试以管理员权限运行 WeFlow' }
+      }
+      return { success: false, error: dllError || '初始化微信取钥 Hook 失败' }
+    }
+
+    const logs: string[] = []
+    const seenStatus = new Set<string>()
+    const pushStatus = (message: string, level: number) => {
+      const normalized = String(message || '').trim()
+      if (!normalized) return
+      const marker = `${level}:${normalized}`
+      if (seenStatus.has(marker)) return
+      seenStatus.add(marker)
+      logs.push(normalized)
+      onStatus?.(normalized, level)
+    }
+
+    try {
+      const deadline = Date.now() + Math.max(timeoutMs, 5000)
+      while (Date.now() < deadline) {
+        if (this.getStatusMessage) {
+          for (let i = 0; i < 5; i++) {
+            const statusBuffer = Buffer.alloc(4096)
+            const levelBuffer = Buffer.alloc(4)
+            const hasStatus = this.getStatusMessage(statusBuffer, statusBuffer.length, levelBuffer)
+            if (!hasStatus) break
+            pushStatus(this.decodeUtf8(statusBuffer), levelBuffer.readInt32LE(0))
+          }
+        }
+
+        if (this.pollKeyData) {
+          const keyBuffer = Buffer.alloc(65536)
+          const ok = this.pollKeyData(keyBuffer, keyBuffer.length)
+          if (ok) {
+            const parsed = this.parseDbKeyPayload(this.decodeUtf8(keyBuffer))
+            if (parsed?.success) {
+              return { ...parsed, logs, source: 'dll' }
+            }
+            return { success: false, error: 'wx_key.dll 返回了无法识别的密钥格式', logs }
+          }
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 150))
+      }
+    } finally {
+      try {
+        this.cleanupHook()
+      } catch { }
+    }
+
+    const loginRequiredAfter = await this.detectWeChatLoginRequired(pid)
+    if (!loginRequiredBefore && !loginRequiredAfter && readyBefore) {
+      return {
+        success: false,
+        error: '当前微信已处于登录后的运行态，DLL 取钥需要在登录过程中抓取。请退出并重新登录微信后再试。',
+        logs
+      }
+    }
+
+    if (loginRequiredBefore || loginRequiredAfter) {
+      return {
+        success: false,
+        error: '微信尚未完成登录，请先完成登录后重试自动取钥。',
+        logs
+      }
+    }
+
+    return {
+      success: false,
+      error: '等待微信返回数据库密钥超时，请在微信登录过程中重试。',
+      logs
+    }
+  }
+
+  private async _autoGetDbKeyChain(
+    timeoutMs = 60_000,
+    onStatus?: (message: string, level: number) => void
+  ): Promise<DbKeyResult> {
+    if (!this.ensureWin32()) return { success: false, error: '仅支持 Windows' }
+
+    const chainLogs: string[] = []
+    const seenLogs = new Set<string>()
+    const emitStatus = (message: string, level: number) => {
+      const normalized = String(message || '').trim()
+      if (!normalized) return
+      const marker = `${level}:${normalized}`
+      if (!seenLogs.has(marker)) {
+        seenLogs.add(marker)
+        chainLogs.push(normalized)
+      }
+      onStatus?.(normalized, level)
+    }
+
+    emitStatus('取钥策略：优先自有桥接，其次自有内存扫描，最后才回退 wx_key.dll', 0)
+
+    emitStatus('Trying PyWxDump bridge first...', 0)
+    const pyResult = await this._getDbKeyViaPyWxDump(emitStatus)
+    if (pyResult.success) {
+      const pyKeys = this.normalizeWcdbKeys(pyResult.wcdbKeys)
+      if (pyKeys) {
+        const supplementedKeys = await this.supplementWcdbKeysIfNeeded(pyKeys, emitStatus)
+        return { ...pyResult, wcdbKeys: supplementedKeys, logs: chainLogs }
+      }
+      return { ...pyResult, logs: chainLogs }
+    }
+
+    emitStatus(`PyWxDump missed: ${pyResult.error || 'no usable key returned'}`, 1)
+    emitStatus('Trying native memory scan...', 1)
+    const nativeResult = await this._getDbKeyViaNativeMemoryScan(emitStatus)
+    if (nativeResult.success) return { ...nativeResult, logs: chainLogs }
+
+    emitStatus(`Native scan missed: ${nativeResult.error || 'no usable key returned'}`, 1)
+    emitStatus('Falling back to wx_key.dll as the last resort...', 1)
+    const dllResult = await this._getDbKeyViaDll(timeoutMs, emitStatus)
+    if (dllResult.success) return { ...dllResult, logs: chainLogs }
+
+    emitStatus(`DLL fallback missed: ${dllResult.error || 'no usable key returned'}`, 1)
+    return {
+      success: false,
+      error: dllResult.error || nativeResult.error || pyResult.error || '自动获取数据库密钥失败',
+      logs: chainLogs,
+      source: dllResult.source ?? nativeResult.source ?? pyResult.source
+    }
+  }
 
   private cleanWxid(wxid: string): string {
-    // 截断到第二个下划线: wxid_g4pshorcc0r529_da6c → wxid_g4pshorcc0r529
     const first = wxid.indexOf('_')
     if (first === -1) return wxid
     const second = wxid.indexOf('_', first + 1)
@@ -778,7 +2664,7 @@ export class KeyService {
           if (!this.verifyDerivedAesKey(aesKey, verifyCiphertext)) continue
           onProgress?.(`密钥获取成功 (wxid: ${candidateWxid}, code: ${code})`)
           console.log('[ImageKey] 校验命中: wxid=', candidateWxid, 'code=', code)
-          return { success: true, xorKey, aesKey }
+          return { success: true, xorKey, aesKey, verified: true }
         }
       }
       return { success: false, error: '缓存 code 与当前账号 wxid 未匹配，请确认账号目录后重试，或使用内存扫描' }
@@ -790,7 +2676,7 @@ export class KeyService {
     const { xorKey, aesKey } = this.deriveImageKeys(fallbackCode, fallbackWxid)
     onProgress?.(`密钥获取成功 (wxid: ${fallbackWxid}, code: ${fallbackCode})`)
     console.log('[ImageKey] 回退计算: wxid=', fallbackWxid, 'code=', fallbackCode)
-    return { success: true, xorKey, aesKey }
+    return { success: true, xorKey, aesKey, verified: false }
   }
 
   // --- 内存扫描备选方案（融合 Dart+Python 优点）---

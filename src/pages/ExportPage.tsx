@@ -43,6 +43,7 @@ import {
   requestCancelBackgroundTasks,
   subscribeBackgroundTasks
 } from '../services/backgroundTaskMonitor'
+import { useAppStore } from '../stores/appStore'
 import { useContactTypeCountsStore } from '../stores/contactTypeCountsStore'
 import { SnsPostItem } from '../components/Sns/SnsPostItem'
 import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
@@ -1388,6 +1389,7 @@ const TaskCenterModal = memo(function TaskCenterModal({
 
 function ExportPage() {
   const location = useLocation()
+  const isDbConnected = useAppStore((state) => state.isDbConnected)
   const isExportRoute = location.pathname === '/export'
 
   const [isLoading, setIsLoading] = useState(true)
@@ -2107,6 +2109,12 @@ function ExportPage() {
   }, [ensureExportCacheScope])
 
   const loadSnsStats = useCallback(async (options?: { full?: boolean; silent?: boolean }) => {
+    if (!isDbConnected) {
+      if (!options?.silent) {
+        setIsSnsStatsLoading(false)
+      }
+      return
+    }
     if (!options?.silent) {
       setIsSnsStatsLoading(true)
     }
@@ -2154,9 +2162,13 @@ function ExportPage() {
         setIsSnsStatsLoading(false)
       }
     }
-  }, [])
+  }, [isDbConnected])
 
   const loadSnsUserPostCounts = useCallback(async (options?: { force?: boolean }) => {
+    if (!isDbConnected) {
+      setSnsUserPostCountsStatus('idle')
+      return
+    }
     if (snsUserPostCountsStatus === 'loading') return
     if (!options?.force && snsUserPostCountsStatus === 'ready') return
 
@@ -2279,7 +2291,7 @@ function ExportPage() {
     }
 
     applyBatch()
-  }, [ensureExportCacheScope, patchSessionLoadTraceStage, snsUserPostCountsStatus])
+  }, [ensureExportCacheScope, isDbConnected, patchSessionLoadTraceStage, snsUserPostCountsStatus])
 
   const loadSessionSnsTimelinePosts = useCallback(async (target: SessionSnsTimelineTarget, options?: { reset?: boolean }) => {
     const reset = Boolean(options?.reset)
@@ -3023,6 +3035,7 @@ function ExportPage() {
   }, [mergeSessionContentMetrics, scheduleFlushSessionMediaMetricCache])
 
   const runSessionMediaMetricWorker = useCallback(async (runId: number) => {
+    if (!isDbConnected) return
     if (sessionMediaMetricWorkerRunningRef.current) return
     sessionMediaMetricWorkerRunningRef.current = true
     try {
@@ -3097,7 +3110,7 @@ function ExportPage() {
         void runSessionMediaMetricWorker(runId)
       }
     }
-  }, [applySessionMediaMetricsFromStats, isSessionMediaMetricReady, patchSessionLoadTraceStage])
+  }, [applySessionMediaMetricsFromStats, isDbConnected, isSessionMediaMetricReady, patchSessionLoadTraceStage])
 
   const scheduleSessionMediaMetricWorker = useCallback(() => {
     if (!isSessionCountStageReady) return
@@ -3352,6 +3365,13 @@ function ExportPage() {
   }, [mergeSessionContentMetrics, patchSessionLoadTraceStage])
 
   const loadSessions = useCallback(async () => {
+    if (!isDbConnected) {
+      setIsLoading(false)
+      setIsSessionEnriching(false)
+      setIsLoadingSessionCounts(false)
+      setIsSessionCountStageReady(false)
+      return
+    }
     const loadToken = Date.now()
     sessionLoadTokenRef.current = loadToken
     sessionsHydratedAtRef.current = 0
@@ -3690,10 +3710,10 @@ function ExportPage() {
     } finally {
       if (!isStale()) setIsLoading(false)
     }
-  }, [ensureExportCacheScope, loadContactsCaches, loadSessionMessageCounts, mergeSessionContentMetrics, patchSessionLoadTraceStage, rebuildSessionMutualFriendsStateFromDirectMetrics, resetSessionMediaMetricLoader, resetSessionMutualFriendsLoader, syncContactTypeCounts])
+  }, [ensureExportCacheScope, isDbConnected, loadContactsCaches, loadSessionMessageCounts, mergeSessionContentMetrics, patchSessionLoadTraceStage, rebuildSessionMutualFriendsStateFromDirectMetrics, resetSessionMediaMetricLoader, resetSessionMutualFriendsLoader, syncContactTypeCounts])
 
   useEffect(() => {
-    if (!isExportRoute) return
+    if (!isExportRoute || !isDbConnected) return
     const now = Date.now()
     const hasFreshSessionSnapshot = hasBaseConfigReadyRef.current &&
       sessionsRef.current.length > 0 &&
@@ -3717,7 +3737,7 @@ function ExportPage() {
     }, 120)
 
     return () => window.clearTimeout(timer)
-  }, [isExportRoute, ensureSharedTabCountsLoaded, loadBaseConfig, loadSessions, loadSnsStats])
+  }, [isDbConnected, isExportRoute, ensureSharedTabCountsLoaded, loadBaseConfig, loadSessions, loadSnsStats])
 
   useEffect(() => {
     if (isExportRoute) return
@@ -5512,13 +5532,13 @@ function ExportPage() {
   ])
 
   useEffect(() => {
-    if (!isExportRoute || !isSessionCountStageReady) return
+    if (!isExportRoute || !isDbConnected || !isSessionCountStageReady) return
     if (snsUserPostCountsStatus !== 'idle') return
     const timer = window.setTimeout(() => {
       void loadSnsUserPostCounts()
     }, 260)
     return () => window.clearTimeout(timer)
-  }, [isExportRoute, isSessionCountStageReady, loadSnsUserPostCounts, snsUserPostCountsStatus])
+  }, [isDbConnected, isExportRoute, isSessionCountStageReady, loadSnsUserPostCounts, snsUserPostCountsStatus])
 
   useEffect(() => {
     if (!sessionSnsTimelineTarget) return

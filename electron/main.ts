@@ -1444,6 +1444,10 @@ function registerIpcHandlers() {
     return true
   })
 
+  ipcMain.handle('wcdb:getRuntimeStatus', async () => {
+    return wcdbService.getRuntimeStatus()
+  })
+
 
 
   // 聊天相关
@@ -2622,11 +2626,11 @@ app.whenReady().then(async () => {
   mainWindow = createWindow({ autoShow: false })
 
   // 初始化系统托盘图标（与其他窗口 icon 路径逻辑保持一致）
-  const resolvedTrayIcon = process.platform === 'win32'
-    ? join(__dirname, '../public/icon.ico')
-    : (process.platform === 'darwin'
+  const resolvedTrayIcon = app.isPackaged
+    ? (process.platform === 'darwin'
         ? join(process.resourcesPath, 'icon.icns')
         : join(process.resourcesPath, 'icon.ico'))
+    : join(__dirname, '../public/icon.ico')
   try {
     tray = new Tray(resolvedTrayIcon)
     tray.setToolTip('WeFlow')

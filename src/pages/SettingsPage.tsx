@@ -38,6 +38,65 @@ interface WxidOption {
   avatarUrl?: string
 }
 
+interface DbRuntimeStatus {
+  initialized: boolean
+  fallbackMode: boolean
+  dllAvailable: boolean
+  dllInitError: string | null
+}
+
+const formatDbKeyFailureMessage = (error?: string, logs?: string[]): string => {
+  const rawBase = String(error || '自动获取密钥失败').trim()
+  const base = rawBase.includes('DLL 取钥需要在登录过程中抓取')
+    ? '自有链路未取到密钥，DLL 回退需要在登录过程中抓取。请退出并重新登录微信后重试'
+    : rawBase
+  const tailLogs = Array.isArray(logs)
+    ? logs
+      .map(item => String(item || '').trim())
+      .filter(Boolean)
+      .slice(-6)
+    : []
+  if (tailLogs.length === 0) return base
+  return `${base}；最近状态：${tailLogs.join(' | ')}`
+}
+
+const getDbKeySourceLabel = (source?: 'pywxdump' | 'native' | 'dll'): string => {
+  if (source === 'pywxdump') return '自有桥接'
+  if (source === 'native') return '自有内存扫描'
+  if (source === 'dll') return 'DLL 回退'
+  return '自动链路'
+}
+
+const isExpiredDllFallback = (status?: DbRuntimeStatus | null): boolean => {
+  const error = String(status?.dllInitError || '')
+  return Boolean(status?.fallbackMode && error.includes('WCDB DLL 已过期并触发自毁'))
+}
+
+const formatDbRuntimeStatus = (status?: DbRuntimeStatus | null): string => {
+  if (!status?.initialized) return ''
+  if (isExpiredDllFallback(status)) {
+    return '当前数据库运行模式：自有 fallback。内置 WCDB DLL 已过期并返回 -1000，但已自动切到自有链路，当前读取和导出可继续使用。'
+  }
+  if (status.fallbackMode) {
+    return status.dllInitError
+      ? `当前数据库运行模式：自有 fallback。DLL 状态：${status.dllInitError}`
+      : '当前数据库运行模式：自有 fallback。当前读取链路可继续使用。'
+  }
+  return '当前数据库运行模式：WCDB DLL 直连。'
+}
+
+const tabDescriptions: Record<SettingsTab, string> = {
+  appearance: '主题、配色与界面显示',
+  notification: '新消息通知与过滤规则',
+  database: '数据库连接、密钥与账号配置',
+  models: '语音转写模型与下载目录',
+  cache: '缓存位置与清理选项',
+  api: '本地 HTTP API 服务配置',
+  security: '应用锁、密码与 Windows Hello',
+  about: '版本、更新与项目信息',
+  analytics: '分析偏好与词云排除词'
+}
+
 interface SettingsPageProps {
   onClose?: () => void
 }
@@ -73,6 +132,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const clearAnalyticsStoreCache = useAnalyticsStore((state) => state.clearCache)
 
   const [activeTab, setActiveTab] = useState<SettingsTab>('appearance')
+  const activeTabMeta = tabs.find((tab) => tab.id === activeTab)
   const [decryptKey, setDecryptKey] = useState('')
   const [wcdbKeys, setWcdbKeys] = useState<Record<string, string> | null>(null)
   const [imageXorKey, setImageXorKey] = useState('')
@@ -134,6 +194,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [message, setMessage] = useState<{ text: string; success: boolean } | null>(null)
   const [showDecryptKey, setShowDecryptKey] = useState(false)
   const [dbKeyStatus, setDbKeyStatus] = useState('')
+  const [dbRuntimeStatus, setDbRuntimeStatus] = useState<DbRuntimeStatus | null>(null)
   const [imageKeyStatus, setImageKeyStatus] = useState('')
   const [isManualStartPrompt, setIsManualStartPrompt] = useState(false)
   const [isClearingAnalyticsCache, setIsClearingAnalyticsCache] = useState(false)
@@ -248,6 +309,25 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       removeImage?.()
     }
   }, [])
+
+  const refreshDbRuntimeStatus = async (): Promise<DbRuntimeStatus | null> => {
+    try {
+      const runtime = await window.electronAPI.wcdb.getRuntimeStatus()
+      setDbRuntimeStatus(runtime)
+      return runtime
+    } catch {
+      setDbRuntimeStatus(null)
+      return null
+    }
+  }
+
+  useEffect(() => {
+    if (isDbConnected) {
+      void refreshDbRuntimeStatus()
+    } else {
+      setDbRuntimeStatus(null)
+    }
+  }, [isDbConnected])
 
   // 点击外部关闭自定义下拉框
   useEffect(() => {
@@ -549,6 +629,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         await window.electronAPI.chat.close()
         const result = await window.electronAPI.chat.connect()
         setDbConnected(result.success, dbPath || undefined)
+        if (result.success) {
+          await refreshDbRuntimeStatus()
+        }
         if (!result.success && result.error) {
           showMessage(result.error, false)
         }
@@ -733,24 +816,32 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       if (result.success && result.key) {
         setDecryptKey(result.key)
         setWcdbKeys(null)
-        setDbKeyStatus('密钥获取成功')
-        showMessage('已自动获取解密密钥', true)
+        const sourceLabel = getDbKeySourceLabel(result.source)
+        setDbKeyStatus(`密钥获取成功（${sourceLabel}）`)
+        showMessage(`已自动获取解密密钥（${sourceLabel}）`, true)
         await syncCurrentKeys({ decryptKey: result.key, wxid })
         const keysOverride = buildKeysFromInputs({ decryptKey: result.key })
         await handleScanWxid(true, { preferCurrentKeys: true, showDialog: false, keysOverride })
       } else if (result.success && result.wcdbKeys && Object.keys(result.wcdbKeys).length > 0) {
         setWcdbKeys(result.wcdbKeys)
         setDecryptKey('')
-        setDbKeyStatus(`密钥获取成功（多密钥模式，共 ${Object.keys(result.wcdbKeys).length} 个）`)
-        showMessage('已自动获取解密密钥（Weixin 4.x 多密钥模式）', true)
+        const sourceLabel = getDbKeySourceLabel(result.source)
+        setDbKeyStatus(`密钥获取成功（${sourceLabel} / 多密钥模式，共 ${Object.keys(result.wcdbKeys).length} 个）`)
+        showMessage(`已自动获取解密密钥（${sourceLabel} / Weixin 4.x 多密钥模式）`, true)
         await configService.setWcdbKeys(result.wcdbKeys)
         await handleScanWxid(true, { preferCurrentKeys: false, showDialog: false })
       } else {
+        const failureMessage = formatDbKeyFailureMessage(result.error, result.logs)
         if (result.error?.includes('未找到微信安装路径') || result.error?.includes('启动微信失败')) {
           setIsManualStartPrompt(true)
           setDbKeyStatus('需要手动启动微信')
+          showMessage(failureMessage, false)
+        } else if (result.error?.includes('DLL 取钥需要在登录过程中抓取')) {
+          setDbKeyStatus('自有链路未命中，DLL 回退需要在登录过程中抓取')
+          showMessage(failureMessage, false)
         } else {
-          showMessage(result.error || '自动获取密钥失败', false)
+          setDbKeyStatus('自动获取密钥失败')
+          showMessage(failureMessage, false)
         }
       }
     } catch (e: any) {
@@ -1358,6 +1449,11 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
           </button>
         )}
         {dbKeyStatus && <div className="form-hint status-text">{dbKeyStatus}</div>}
+        {dbRuntimeStatus && (
+          <div className={`form-hint status-text ${isExpiredDllFallback(dbRuntimeStatus) ? 'is-success' : ''}`}>
+            {formatDbRuntimeStatus(dbRuntimeStatus)}
+          </div>
+        )}
       </div>
 
       <div className="form-group">
@@ -1419,6 +1515,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                       await window.electronAPI.chat.close()
                       const result = await window.electronAPI.chat.connect()
                       setDbConnected(result.success, dbPath || undefined)
+                      if (result.success) {
+                        await refreshDbRuntimeStatus()
+                      }
                       if (!result.success && result.error) {
                         showMessage(result.error, false)
                       }
@@ -2218,6 +2317,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         <div className="settings-header">
           <div className="settings-title-block">
             <h1>设置</h1>
+            <p>{activeTabMeta?.label ?? '设置'} · {tabDescriptions[activeTab]}</p>
           </div>
           <div className="settings-actions">
             <button className="btn btn-secondary" onClick={handleTestConnection} disabled={isLoading || isTesting}>

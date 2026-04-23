@@ -2,6 +2,7 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { pyWxDumpService } from './pyWxDumpService'
+import { nativeSqlcipherService } from './nativeSqlcipherService'
 
 // DLL 初始化错误信息，用于帮助用户诊断问题
 let lastDllInitError: string | null = null
@@ -51,6 +52,11 @@ export function getLastDllInitError(): string | null {
   return lastDllInitError
 }
 
+export function isDllFallbackUsableMessage(message?: string | null): boolean {
+  const text = String(message || '').toLowerCase()
+  return text.includes('expired: self-destruct triggered') || text.includes('已过期并触发自毁')
+}
+
 export class WcdbCore {
   private resourcesPath: string | null = null
   private userDataPath: string | null = null
@@ -64,8 +70,8 @@ export class WcdbCore {
   private currentWxid: string | null = null
   private currentDbStoragePath: string | null = null
 
-  // --------------- PyWxDump fallback 模式 ---------------
-  // DLL 不可用时，通过 PyWxDump 解密数据库后用 better-sqlite3 直接读取
+  // --------------- 自有 fallback 模式 ---------------
+  // DLL 不可用时，优先走自有解密链路，再用 better-sqlite3 直接读取
   private fallbackMode = false
   private fallbackDecryptedDir: string | null = null
   // better-sqlite3 连接缓存: 解密后文件路径 -> Database 实例
@@ -359,6 +365,70 @@ export class WcdbCore {
     return compact.slice(0, maxLen) + '...'
   }
 
+  private readNativeLogs(): string[] {
+    try {
+      if (!this.wcdbGetLogs) return []
+      const outPtr = [null as any]
+      const result = this.wcdbGetLogs(outPtr)
+      if (result !== 0 || !outPtr[0]) return []
+
+      let jsonStr = ''
+      try {
+        jsonStr = this.koffi.decode(outPtr[0], 'char', -1)
+      } finally {
+        try { this.wcdbFreeString(outPtr[0]) } catch { }
+      }
+
+      if (!jsonStr) return []
+      try {
+        const parsed = JSON.parse(jsonStr)
+        if (Array.isArray(parsed)) {
+          return parsed.map((item) => String(item || '')).filter(Boolean)
+        }
+      } catch {
+        // ignore JSON parse error and fall through to raw text
+      }
+
+      return [jsonStr]
+    } catch {
+      return []
+    }
+  }
+
+  private describeDllInitFailure(initResult: number, logs: string[]): string {
+    const joined = logs.join(' | ')
+    const lower = joined.toLowerCase()
+    const execName = basename(process.execPath || process.argv[0] || '')
+
+    if (lower.includes('expired: self-destruct triggered')) {
+      return `WCDB DLL 已过期并触发自毁（错误码: ${initResult}，进程: ${execName}）。当前 resources/wcdb_api.dll 已不可用，需要替换 DLL 或彻底切到纯自有实现。`
+    }
+
+    if (lower.includes('securitystatus:2') || lower.includes('security verification failed')) {
+      return `WCDB DLL 安全校验失败（错误码: ${initResult}，进程: ${execName}）。当前进程名或运行形态未通过 DLL 校验。`
+    }
+
+    if (joined) {
+      return `WCDB 初始化失败（错误码: ${initResult}）。原生日志: ${joined}`
+    }
+
+    return `初始化失败（错误码: ${initResult}）`
+  }
+
+  getRuntimeStatus(): {
+    initialized: boolean
+    fallbackMode: boolean
+    dllAvailable: boolean
+    dllInitError: string | null
+  } {
+    return {
+      initialized: this.initialized,
+      fallbackMode: this.fallbackMode,
+      dllAvailable: this.initialized && !this.fallbackMode,
+      dllInitError: lastDllInitError
+    }
+  }
+
   private async dumpDbStatus(tag: string): Promise<void> {
     try {
       if (!this.ensureReady()) {
@@ -548,17 +618,10 @@ export class WcdbCore {
   async initialize(): Promise<boolean> {
     if (this.initialized) return true
 
-    // ── PyWxDump 彻底替换模式：完全跳过 DLL 加载 ──
-    this.writeLog('[bootstrap] PyWxDump mode: skipping DLL, using better-sqlite3', true)
-    this.fallbackMode = true
-    this.initialized = true
-    return true
-
-    // eslint-disable-next-line no-unreachable
     try {
       this.koffi = require('koffi')
       const dllPath = this.getDllPath()
-      this.writeLog(`[bootstrap] initialize platform=${process.platform} dllPath=${dllPath} resourcesPath=${this.resourcesPath || ''} userDataPath=${this.userDataPath || ''}`, true)
+      this.writeLog(`[bootstrap] initialize platform=${process.platform} execPath=${process.execPath || ''} dllPath=${dllPath} resourcesPath=${this.resourcesPath || ''} userDataPath=${this.userDataPath || ''}`, true)
 
       if (!existsSync(dllPath)) {
         console.error('WCDB DLL 不存在:', dllPath)
@@ -623,24 +686,21 @@ export class WcdbCore {
         let protectionOk = false
         for (const resPath of resourcePaths) {
           try {
-            // 
             protectionOk = this.wcdbInitProtection(resPath)
+            this.writeLog(`[bootstrap] InitProtection(${resPath}) => ${protectionOk ? 'ok' : 'fail'}`, true)
             if (protectionOk) {
-              // 
               break
             }
           } catch (e) {
-            // console.warn(`[WCDB] InitProtection 失败 (${resPath}):`, e)
+            this.writeLog(`[bootstrap] InitProtection exception (${resPath}): ${String(e)}`, true)
           }
         }
 
         if (!protectionOk) {
-          // console.warn('[WCDB] Core security check failed - 继续运行但可能不稳定')
-          // this.writeLog('InitProtection 失败，继续运行')
-          // 不返回 false，允许继续运行
+          this.writeLog('[bootstrap] InitProtection failed for all candidate paths, continuing anyway', true)
         }
       } catch (e) {
-        // console.warn('InitProtection symbol not found:', e)
+        this.writeLog(`[bootstrap] InitProtection symbol unavailable: ${String(e)}`, true)
       }
 
       // 定义类型
@@ -929,10 +989,23 @@ export class WcdbCore {
 
       // 初始化
       const initResult = this.wcdbInit()
+      this.writeLog(`[bootstrap] wcdb_init() => ${initResult}`, true)
       if (initResult !== 0) {
-        console.error('WCDB 初始化失败:', initResult)
-        lastDllInitError = `初始化失败（错误码: ${initResult}）`
-        return false
+        const initLogs = this.readNativeLogs()
+        if (initLogs.length > 0) {
+          this.writeLog(`[bootstrap] wcdb_init logs=${JSON.stringify(initLogs)}`, true)
+        }
+        lastDllInitError = this.describeDllInitFailure(initResult, initLogs)
+        if (isDllFallbackUsableMessage(lastDllInitError)) {
+          console.warn(`WCDB DLL 初始化返回 ${initResult}，DLL 已过期，已切换到自有 fallback`)
+          this.writeLog(`[bootstrap] DLL init returned ${initResult}; dll expired, fallback remains usable`, true)
+        } else {
+          console.warn(`WCDB DLL 初始化返回 ${initResult}，已切换到 fallback 模式`)
+          this.writeLog('DLL 初始化返回非 0，切换到 fallback 模式', true)
+        }
+        this.fallbackMode = true
+        this.initialized = true
+        return true
       }
 
       this.initialized = true
@@ -951,8 +1024,8 @@ export class WcdbCore {
         lastDllInitError = 'DLL 架构不匹配。请确保使用 64 位版本的应用程序。'
       }
 
-      // DLL 失败时激活 PyWxDump fallback 模式
-      this.writeLog('DLL 初始化失败，切换到 PyWxDump fallback 模式', true)
+      // DLL 失败时激活自有 fallback 模式
+      this.writeLog('DLL 初始化失败，切换到自有 fallback 模式', true)
       this.fallbackMode = true
       this.initialized = true   // 标记为"已初始化（fallback 模式）"
       return true
@@ -1062,17 +1135,9 @@ export class WcdbCore {
    */
   private async printLogs(force = false): Promise<void> {
     try {
-      if (!this.wcdbGetLogs) return
-      const outPtr = [null as any]
-      const result = this.wcdbGetLogs(outPtr)
-      if (result === 0 && outPtr[0]) {
-        try {
-          const jsonStr = this.koffi.decode(outPtr[0], 'char', -1)
-          this.writeLog(`wcdb_logs: ${jsonStr}`, force)
-          this.wcdbFreeString(outPtr[0])
-        } catch (e) {
-          // ignore
-        }
+      const logs = this.readNativeLogs()
+      if (logs.length > 0) {
+        this.writeLog(`wcdb_logs: ${JSON.stringify(logs)}`, force)
       }
     } catch (e) {
       console.error('获取日志失败:', e)
@@ -1173,7 +1238,7 @@ export class WcdbCore {
     this.currentWcdbKeys = wcdbKeys
   }
 
-  /** 当前是否运行在 PyWxDump fallback 模式下 */
+  /** 当前是否运行在自有 fallback 模式下 */
   isFallbackMode(): boolean {
     return this.fallbackMode
   }
@@ -1235,7 +1300,7 @@ export class WcdbCore {
         this.writeLog(`open failed: openAccount code=${result}`)
 
         // DLL 打开失败时自动切换到 fallback 模式
-        this.writeLog('DLL 打开数据库失败，切换到 PyWxDump fallback 模式', true)
+        this.writeLog('DLL 打开数据库失败，切换到自有 fallback 模式', true)
         this.fallbackMode = true
         this.handle = null
         return this.openFallback(dbPath, hexKey, wxid)
@@ -1244,7 +1309,7 @@ export class WcdbCore {
       const handle = handleOut[0]
       if (handle <= 0) {
         // 同上，handle 无效时切换 fallback
-        this.writeLog('DLL 返回无效 handle，切换到 PyWxDump fallback 模式', true)
+        this.writeLog('DLL 返回无效 handle，切换到自有 fallback 模式', true)
         this.fallbackMode = true
         return this.openFallback(dbPath, hexKey, wxid)
       }
@@ -1360,17 +1425,40 @@ export class WcdbCore {
 
       this.writeLog(`openFallback decrypting to ${outDir}`, true)
 
-      // hexKey 可能是单 key（旧版）或者 wcdbKeys JSON（新版）
-      const keyArg = this.currentWcdbKeys
-        ? JSON.stringify(this.currentWcdbKeys)
-        : hexKey
+      let result: { success: boolean; decrypted?: number; failed?: number; error?: string }
+      const wcdbKeys = this.currentWcdbKeys && Object.keys(this.currentWcdbKeys).length > 0
+        ? this.currentWcdbKeys
+        : null
 
-      const result = await pyWxDumpService.decryptDbDir(
-        keyArg,
-        dbStoragePath,
-        outDir,
-        (msg) => this.writeLog(`openFallback: ${msg}`, true)
-      )
+      if (wcdbKeys) {
+        this.writeLog(`openFallback: trying native SQLCipher decrypt with ${Object.keys(wcdbKeys).length} wcdb keys`, true)
+        const nativeResult = await nativeSqlcipherService.decryptDbDir(
+          wcdbKeys,
+          dbStoragePath,
+          outDir,
+          (msg) => this.writeLog(`openFallback(native): ${msg}`, true)
+        )
+
+        if (nativeResult.success) {
+          result = nativeResult
+          this.writeLog(`openFallback: native decrypt ok decrypted=${nativeResult.decrypted ?? 0} failed=${nativeResult.failed ?? 0}`, true)
+        } else {
+          this.writeLog(`openFallback: native decrypt failed: ${nativeResult.error || 'unknown'}`, true)
+          result = await pyWxDumpService.decryptDbDir(
+            JSON.stringify(wcdbKeys),
+            dbStoragePath,
+            outDir,
+            (msg) => this.writeLog(`openFallback(pywxdump): ${msg}`, true)
+          )
+        }
+      } else {
+        result = await pyWxDumpService.decryptDbDir(
+          hexKey,
+          dbStoragePath,
+          outDir,
+          (msg) => this.writeLog(`openFallback(pywxdump): ${msg}`, true)
+        )
+      }
 
       if (!result.success) {
         this.writeLog(`openFallback decrypt failed: ${result.error}`, true)
@@ -2610,7 +2698,15 @@ export class WcdbCore {
               }
               if (!tbl) continue
               const cnt: any = db.prepare(`SELECT COUNT(1) AS cnt FROM "${tbl}"`).get()
-              tables.push({ tableName: tbl, count: cnt?.cnt ?? 0, dbPath: full })
+              const count = Number(cnt?.cnt ?? 0)
+              tables.push({
+                tableName: tbl,
+                table_name: tbl,
+                name: tbl,
+                count,
+                dbPath: full,
+                db_path: full
+              })
             } catch {}
           }
         } catch {}

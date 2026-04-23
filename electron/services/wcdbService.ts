@@ -36,13 +36,19 @@ export class WcdbService {
     if (this.worker) return
 
     const isDev = process.env.NODE_ENV === 'development'
-    const workerPath = isDev
-      ? join(__dirname, '../dist-electron/wcdbWorker.js')
-      : join(__dirname, 'wcdbWorker.js')
+    const candidates = [
+      process.env.WCDB_WORKER_PATH || '',
+      isDev ? join(process.cwd(), 'dist-electron', 'wcdbWorker.js') : '',
+      isDev ? join(process.cwd(), 'dist-electron', 'electron', 'wcdbWorker.js') : '',
+      join(__dirname, '../wcdbWorker.js'),
+      join(__dirname, 'wcdbWorker.js'),
+      join(process.resourcesPath || '', 'app.asar.unpacked', 'dist-electron', 'wcdbWorker.js'),
+    ].filter(Boolean)
 
-    let finalPath = workerPath
-    if (isDev && !existsSync(finalPath)) {
-      finalPath = join(__dirname, 'wcdbWorker.js')
+    const finalPath = candidates.find((candidate) => existsSync(candidate))
+
+    if (!finalPath) {
+      throw new Error(`未找到 WCDB Worker。candidates=${candidates.join(' | ')}`)
     }
 
     try {
@@ -169,6 +175,15 @@ export class WcdbService {
    */
   async open(dbPath: string, hexKey: string, wxid: string): Promise<boolean> {
     return this.callWorker('open', { dbPath, hexKey, wxid })
+  }
+
+  getRuntimeStatus(): Promise<{
+    initialized: boolean
+    fallbackMode: boolean
+    dllAvailable: boolean
+    dllInitError: string | null
+  }> {
+    return this.callWorker('getRuntimeStatus')
   }
 
   /**

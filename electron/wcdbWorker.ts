@@ -48,6 +48,9 @@ if (parentPort) {
                 case 'isConnected':
                     result = core.isConnected()
                     break
+                case 'getRuntimeStatus':
+                    result = core.getRuntimeStatus()
+                    break
                 case 'getSessions':
                     result = await core.getSessions()
                     break

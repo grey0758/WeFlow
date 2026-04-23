@@ -24,8 +24,18 @@ interface WelcomePageProps {
   standalone?: boolean
 }
 
+interface DbRuntimeStatus {
+  initialized: boolean
+  fallbackMode: boolean
+  dllAvailable: boolean
+  dllInitError: string | null
+}
+
 const formatDbKeyFailureMessage = (error?: string, logs?: string[]): string => {
-  const base = String(error || '自动获取密钥失败').trim()
+  const rawBase = String(error || '自动获取密钥失败').trim()
+  const base = rawBase.includes('DLL 取钥需要在登录过程中抓取')
+    ? '自有链路未取到密钥，DLL 回退需要在登录过程中抓取。请退出并重新登录微信后重试'
+    : rawBase
   const tailLogs = Array.isArray(logs)
     ? logs
       .map(item => String(item || '').trim())
@@ -34,6 +44,31 @@ const formatDbKeyFailureMessage = (error?: string, logs?: string[]): string => {
     : []
   if (tailLogs.length === 0) return base
   return `${base}；最近状态：${tailLogs.join(' | ')}`
+}
+
+const getDbKeySourceLabel = (source?: 'pywxdump' | 'native' | 'dll'): string => {
+  if (source === 'pywxdump') return '自有桥接'
+  if (source === 'native') return '自有内存扫描'
+  if (source === 'dll') return 'DLL 回退'
+  return '自动链路'
+}
+
+const isExpiredDllFallback = (status?: DbRuntimeStatus | null): boolean => {
+  const error = String(status?.dllInitError || '')
+  return Boolean(status?.fallbackMode && error.includes('WCDB DLL 已过期并触发自毁'))
+}
+
+const formatDbRuntimeStatus = (status?: DbRuntimeStatus | null): string => {
+  if (!status?.initialized) return ''
+  if (isExpiredDllFallback(status)) {
+    return '当前数据库运行模式：自有 fallback。内置 WCDB DLL 已过期并返回 -1000，但已自动切到自有链路，当前读取和导出可继续使用。'
+  }
+  if (status.fallbackMode) {
+    return status.dllInitError
+      ? `当前数据库运行模式：自有 fallback。DLL 状态：${status.dllInitError}`
+      : '当前数据库运行模式：自有 fallback。当前读取链路可继续使用。'
+  }
+  return '当前数据库运行模式：WCDB DLL 直连。'
 }
 
 function WelcomePage({ standalone = false }: WelcomePageProps) {
@@ -65,6 +100,7 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
   const [showDecryptKey, setShowDecryptKey] = useState(false)
   const [isClosing, setIsClosing] = useState(false)
   const [dbKeyStatus, setDbKeyStatus] = useState('')
+  const [dbRuntimeStatus, setDbRuntimeStatus] = useState<DbRuntimeStatus | null>(null)
   const [imageKeyStatus, setImageKeyStatus] = useState('')
   const [isManualStartPrompt, setIsManualStartPrompt] = useState(false)
   const [imageKeyPercent, setImageKeyPercent] = useState<number | null>(null)
@@ -165,6 +201,25 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
       removeImage?.()
     }
   }, [])
+
+  const refreshDbRuntimeStatus = async (): Promise<DbRuntimeStatus | null> => {
+    try {
+      const runtime = await window.electronAPI.wcdb.getRuntimeStatus()
+      setDbRuntimeStatus(runtime)
+      return runtime
+    } catch {
+      setDbRuntimeStatus(null)
+      return null
+    }
+  }
+
+  useEffect(() => {
+    if (isDbConnected) {
+      void refreshDbRuntimeStatus()
+    } else {
+      setDbRuntimeStatus(null)
+    }
+  }, [isDbConnected])
 
   useEffect(() => {
     if (isDbConnected && !standalone) {
@@ -337,13 +392,15 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
       if (result.success && result.key) {
         setDecryptKey(result.key)
         setWcdbKeys(null)
-        setDbKeyStatus('密钥获取成功')
+        const sourceLabel = getDbKeySourceLabel(result.source)
+        setDbKeyStatus(`密钥获取成功（${sourceLabel}）`)
         setError('')
         await handleScanWxid(true)
       } else if (result.success && result.wcdbKeys && Object.keys(result.wcdbKeys).length > 0) {
         setWcdbKeys(result.wcdbKeys)
         setDecryptKey('')
-        setDbKeyStatus(`密钥获取成功（多密钥模式，共 ${Object.keys(result.wcdbKeys).length} 个）`)
+        const sourceLabel = getDbKeySourceLabel(result.source)
+        setDbKeyStatus(`密钥获取成功（${sourceLabel} / 多密钥模式，共 ${Object.keys(result.wcdbKeys).length} 个）`)
         setError('')
         await handleScanWxid(true)
       } else {
@@ -351,7 +408,9 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
           setIsManualStartPrompt(true)
           setDbKeyStatus('需要手动启动微信')
         } else {
-          if (result.error?.includes('尚未完成登录')) {
+          if (result.error?.includes('DLL 取钥需要在登录过程中抓取')) {
+            setDbKeyStatus('自有链路未命中，DLL 回退需要在登录过程中抓取')
+          } else if (result.error?.includes('尚未完成登录')) {
             setDbKeyStatus('请先在微信完成登录后重试')
           }
           setError(formatDbKeyFailureMessage(result.error, result.logs))
@@ -493,6 +552,10 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
 
       await configService.setOnboardingDone(true)
 
+      const runtimeStatus = await refreshDbRuntimeStatus()
+      if (runtimeStatus && isExpiredDllFallback(runtimeStatus)) {
+        setDbKeyStatus(`现在可以登录并继续使用。${formatDbRuntimeStatus(runtimeStatus)}`)
+      }
       setDbConnected(true, dbPath)
       setLoading(false)
 

@@ -1,0 +1,6 @@
+# Local-only WeFlow HTTP API sync config.
+# Copy to `.weflow-http-api.local` and adjust values as needed.
+# The real `.weflow-http-api.local` file is ignored by git.
+
+WEFLOW_PAY_SYNC_URL=http://43.251.227.176:28080/api/internal/wechat-pay-assistant/receipts/sync/
+WEFLOW_PAY_SYNC_SECRET=replace-with-your-local-sync-secret

@@ -101,6 +101,12 @@
 .settings-title-block {
   display: flex;
   flex-direction: column;
+
+  p {
+    margin: 6px 0 0;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
 }
 
 .settings-actions {
@@ -270,6 +276,10 @@
   .status-text {
     margin-top: 6px;
     color: var(--text-secondary);
+
+    &.is-success {
+      color: rgb(22, 163, 74);
+    }
   }
 
   .manual-prompt {
