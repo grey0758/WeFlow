@@ -48,7 +48,7 @@ interface DbRuntimeStatus {
 const formatDbKeyFailureMessage = (error?: string, logs?: string[]): string => {
   const rawBase = String(error || '自动获取密钥失败').trim()
   const base = rawBase.includes('DLL 取钥需要在登录过程中抓取')
-    ? '自有链路未取到密钥，DLL 回退需要在登录过程中抓取。请退出并重新登录微信后重试'
+    ? '自有链路未取到密钥，请保持微信已登录并重试'
     : rawBase
   const tailLogs = Array.isArray(logs)
     ? logs
@@ -63,7 +63,7 @@ const formatDbKeyFailureMessage = (error?: string, logs?: string[]): string => {
 const getDbKeySourceLabel = (source?: 'pywxdump' | 'native' | 'dll'): string => {
   if (source === 'pywxdump') return '自有桥接'
   if (source === 'native') return '自有内存扫描'
-  if (source === 'dll') return 'DLL 回退'
+  if (source === 'dll') return '兼容 DLL'
   return '自动链路'
 }
 
@@ -837,7 +837,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
           setDbKeyStatus('需要手动启动微信')
           showMessage(failureMessage, false)
         } else if (result.error?.includes('DLL 取钥需要在登录过程中抓取')) {
-          setDbKeyStatus('自有链路未命中，DLL 回退需要在登录过程中抓取')
+          setDbKeyStatus('自有链路未命中，请保持微信已登录后重试')
           showMessage(failureMessage, false)
         } else {
           setDbKeyStatus('自动获取密钥失败')

@@ -27,7 +27,7 @@ async function main() {
 
     const pyAttemptIndex = findIndex(['Trying PyWxDump bridge first...'])
     const nativeAttemptIndex = findIndex(['Trying native memory scan...'])
-    const dllAttemptIndex = findIndex(['Falling back to wx_key.dll as the last resort...'])
+    const dllAttemptIndex = findIndex(['Falling back to wx_key.dll as the last resort...', 'DLL fallback:'])
 
     const summary = {
       success: result.success,
@@ -39,11 +39,15 @@ async function main() {
       attemptedPy: pyAttemptIndex >= 0,
       attemptedNative: nativeAttemptIndex >= 0,
       attemptedDll: dllAttemptIndex >= 0,
-      dllOnlyAfterNative: dllAttemptIndex < 0 || (nativeAttemptIndex >= 0 && dllAttemptIndex > nativeAttemptIndex),
+      noDllFallback: dllAttemptIndex < 0,
       nativeCaughtAfterPyMiss: result.success && result.source === 'native',
       pyCaughtDirectly: result.success && result.source === 'pywxdump',
       finalLogsTail: (result.logs ?? []).slice(-12),
       statusCount: statuses.length
+    }
+
+    if (!summary.success || !summary.attemptedPy || summary.attemptedDll || result.source === 'dll') {
+      exitCode = 1
     }
 
     console.log('---SUMMARY_START---')

@@ -1,6 +1,6 @@
 import { app } from 'electron'
 import { join, dirname, basename } from 'path'
-import { existsSync, copyFileSync, mkdirSync } from 'fs'
+import { existsSync, copyFileSync, mkdirSync, readdirSync, statSync } from 'fs'
 import { execFile, spawn } from 'child_process'
 import { promisify } from 'util'
 import os from 'os'
@@ -16,7 +16,7 @@ type DbKeyResult = {
   wcdbKeys?: Record<string, string>
   error?: string
   logs?: string[]
-  source?: 'dll' | 'pywxdump' | 'native'
+  source?: 'pywxdump' | 'native' | 'dll'
 }
 type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string }
 type DbVerificationTarget = { name: string; path: string; saltHex: string; markers: string[] }
@@ -2511,9 +2511,7 @@ export class KeyService {
       }
       onStatus?.(normalized, level)
     }
-
-    emitStatus('取钥策略：优先自有桥接，其次自有内存扫描，最后才回退 wx_key.dll', 0)
-
+    emitStatus('Pure-native key strategy: PyWxDump bridge first, native memory scan second, no DLL fallback', 0)
     emitStatus('Trying PyWxDump bridge first...', 0)
     const pyResult = await this._getDbKeyViaPyWxDump(emitStatus)
     if (pyResult.success) {
@@ -2531,16 +2529,11 @@ export class KeyService {
     if (nativeResult.success) return { ...nativeResult, logs: chainLogs }
 
     emitStatus(`Native scan missed: ${nativeResult.error || 'no usable key returned'}`, 1)
-    emitStatus('Falling back to wx_key.dll as the last resort...', 1)
-    const dllResult = await this._getDbKeyViaDll(timeoutMs, emitStatus)
-    if (dllResult.success) return { ...dllResult, logs: chainLogs }
-
-    emitStatus(`DLL fallback missed: ${dllResult.error || 'no usable key returned'}`, 1)
     return {
       success: false,
-      error: dllResult.error || nativeResult.error || pyResult.error || '自动获取数据库密钥失败',
+      error: nativeResult.error || pyResult.error || 'Pure-native key chain did not produce a usable database key',
       logs: chainLogs,
-      source: dllResult.source ?? nativeResult.source ?? pyResult.source
+      source: nativeResult.source ?? pyResult.source
     }
   }
 
@@ -2614,40 +2607,73 @@ export class KeyService {
     return candidates
   }
 
-  async autoGetImageKey(
+  private collectKvcommCodes(accountPath?: string): number[] {
+    const codeSet = new Set<number>()
+    const pattern = /^key_(\d+)_.+\.statistic$/i
+
+    for (const kvcommDir of this.getKvcommCandidates(accountPath)) {
+      if (!existsSync(kvcommDir)) continue
+      try {
+        const files = readdirSync(kvcommDir)
+        for (const file of files) {
+          const match = file.match(pattern)
+          if (!match) continue
+          const code = Number(match[1])
+          if (!Number.isFinite(code) || code <= 0 || code > 0xFFFFFFFF) continue
+          codeSet.add(code)
+        }
+      } catch { }
+    }
+
+    return Array.from(codeSet)
+  }
+
+  private getKvcommCandidates(accountPath?: string): string[] {
+    const candidates = new Set<string>()
+
+    if (accountPath) {
+      const normalized = accountPath.replace(/[\\/]+$/, '')
+      const slashPath = normalized.replace(/\\/g, '/')
+      const marker = slashPath.match(/\/xwechat_files(?:\/|$)/i) || slashPath.match(/\/wechat files(?:\/|$)/i)
+      if (marker?.index !== undefined) {
+        const root = slashPath.slice(0, marker.index + marker[0].length).replace(/\/+$/, '')
+        const base = root.replace(/\/xwechat_files$/i, '/app_data').replace(/\/wechat files$/i, '/app_data')
+        candidates.add(`${base}/net/kvcomm`)
+      }
+
+      let cursor = normalized
+      for (let i = 0; i < 6; i++) {
+        candidates.add(join(cursor, 'net', 'kvcomm'))
+        const next = dirname(cursor)
+        if (next === cursor) break
+        cursor = next
+      }
+    }
+
+    try {
+      const defaultRoot = dbPathService.getDefaultPath().replace(/[\\/]+$/, '')
+      candidates.add(join(dirname(defaultRoot), 'app_data', 'net', 'kvcomm'))
+      candidates.add(join(defaultRoot, 'app_data', 'net', 'kvcomm'))
+    } catch { }
+
+    return Array.from(candidates)
+  }
+
+  async autoGetImageKeyPure(
       manualDir?: string,
       onProgress?: (message: string) => void,
       wxidParam?: string
   ): Promise<ImageKeyResult> {
-    if (!this.ensureWin32()) return { success: false, error: '仅支持 Windows' }
-    if (!this.ensureLoaded()) return { success: false, error: 'wx_key.dll 未加载' }
+    if (!this.ensureWin32()) return { success: false, error: 'Windows only' }
 
-    onProgress?.('正在从缓存目录扫描图片密钥...')
+    onProgress?.('Deriving image key from kvcomm and template data...')
 
-    const resultBuffer = Buffer.alloc(8192)
-    const ok = this.getImageKeyDll(resultBuffer, resultBuffer.length)
-
-    if (!ok) {
-      const errMsg = this.getLastErrorMsg ? this.decodeCString(this.getLastErrorMsg()) : '获取图片密钥失败'
-      return { success: false, error: errMsg }
+    const codes = this.collectKvcommCodes(manualDir)
+    if (codes.length === 0) {
+      return { success: false, error: 'No kvcomm image-key codes found' }
     }
 
-    const jsonStr = this.decodeUtf8(resultBuffer)
-    let parsed: any
-    try {
-      parsed = JSON.parse(jsonStr)
-    } catch {
-      return { success: false, error: '解析密钥数据失败' }
-    }
-
-    // 从任意账号提取 code 列表（code 来自 kvcomm，与 wxid 无关，所有账号都一样）
-    const accounts: any[] = parsed.accounts ?? []
-    if (!accounts.length || !accounts[0]?.keys?.length) {
-      return { success: false, error: '未找到有效的密钥码（kvcomm 缓存为空）' }
-    }
-
-    const codes: number[] = accounts[0].keys.map((k: any) => k.code)
-    console.log('[ImageKey] codes:', codes, 'DLL wxids:', accounts.map((a: any) => a.wxid))
+    console.log('[ImageKey] kvcomm codes:', codes)
 
     const wxidCandidates = await this.collectWxidCandidates(manualDir, wxidParam)
     let verifyCiphertext: Buffer | null = null
@@ -2657,26 +2683,33 @@ export class KeyService {
     }
 
     if (verifyCiphertext) {
-      onProgress?.(`正在校验候选 wxid（${wxidCandidates.length} 个）...`)
+      onProgress?.(`Verifying ${wxidCandidates.length} wxid candidates...`)
       for (const candidateWxid of wxidCandidates) {
         for (const code of codes) {
           const { xorKey, aesKey } = this.deriveImageKeys(code, candidateWxid)
           if (!this.verifyDerivedAesKey(aesKey, verifyCiphertext)) continue
-          onProgress?.(`密钥获取成功 (wxid: ${candidateWxid}, code: ${code})`)
-          console.log('[ImageKey] 校验命中: wxid=', candidateWxid, 'code=', code)
+          onProgress?.(`Image key resolved (wxid: ${candidateWxid}, code: ${code})`)
+          console.log('[ImageKey] verified:', { wxid: candidateWxid, code })
           return { success: true, xorKey, aesKey, verified: true }
         }
       }
-      return { success: false, error: '缓存 code 与当前账号 wxid 未匹配，请确认账号目录后重试，或使用内存扫描' }
+      return { success: false, error: 'kvcomm code did not match current wxid; verify the account directory or use memory scan' }
     }
 
-    // 无模板密文可验真时回退旧策略
-    const fallbackWxid = wxidCandidates[0] || accounts[0].wxid || 'unknown'
+    const fallbackWxid = wxidCandidates[0] || 'unknown'
     const fallbackCode = codes[0]
     const { xorKey, aesKey } = this.deriveImageKeys(fallbackCode, fallbackWxid)
-    onProgress?.(`密钥获取成功 (wxid: ${fallbackWxid}, code: ${fallbackCode})`)
-    console.log('[ImageKey] 回退计算: wxid=', fallbackWxid, 'code=', fallbackCode)
+    onProgress?.(`Image key resolved (wxid: ${fallbackWxid}, code: ${fallbackCode})`)
+    console.log('[ImageKey] fallback-derived:', { wxid: fallbackWxid, code: fallbackCode })
     return { success: true, xorKey, aesKey, verified: false }
+  }
+
+  async autoGetImageKey(
+      manualDir?: string,
+      onProgress?: (message: string) => void,
+      wxidParam?: string
+  ): Promise<ImageKeyResult> {
+    return this.autoGetImageKeyPure(manualDir, onProgress, wxidParam)
   }
 
   // --- 内存扫描备选方案（融合 Dart+Python 优点）---
