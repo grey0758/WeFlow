@@ -20,18 +20,18 @@ type DbKeyResult = {
 }
 type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string }
 type DbVerificationTarget = { name: string; path: string; saltHex: string; markers: string[] }
+type WxKeyDllCompatApi = {
+  initHook: (pid: number) => boolean
+  pollKeyData: (buffer: Buffer, bufferSize: number) => boolean
+  getStatusMessage: (buffer: Buffer, bufferSize: number, outLevel: Buffer) => boolean
+  cleanupHook: () => boolean
+  getLastErrorMsg: (() => Buffer | string | null | undefined) | null
+}
 
 export class KeyService {
   private readonly isMac = process.platform === 'darwin'
   private koffi: any = null
-  private lib: any = null
-  private initialized = false
-  private initHook: any = null
-  private pollKeyData: any = null
-  private getStatusMessage: any = null
-  private cleanupHook: any = null
-  private getLastErrorMsg: any = null
-  private getImageKeyDll: any = null
+  private dllCompatApi: WxKeyDllCompatApi | null = null
 
   // Win32 APIs
   private kernel32: any = null
@@ -69,6 +69,7 @@ export class KeyService {
   private readonly ERROR_SUCCESS = 0
   private readonly WM_CLOSE = 0x0010
 
+  // Optional wx_key.dll compatibility layer. The default DB/image flows do not depend on it.
   private getDllPath(): string {
     const isPackaged = typeof app !== 'undefined' && app ? app.isPackaged : process.env.NODE_ENV === 'production'
     const archDir = process.arch === 'arm64' ? 'arm64' : 'x64'
@@ -125,16 +126,14 @@ export class KeyService {
     }
   }
 
-  private ensureLoaded(): boolean {
-    if (this.initialized) return true
+  private ensureDllCompatLoaded(): boolean {
+    if (this.dllCompatApi) return true
 
     let dllPath = ''
     try {
       this.koffi = require('koffi')
       dllPath = this.getDllPath()
-
       if (!existsSync(dllPath)) {
-        console.error(`wx_key.dll 不存在于路径: ${dllPath}`)
         return false
       }
 
@@ -142,15 +141,15 @@ export class KeyService {
         dllPath = this.localizeNetworkDll(dllPath)
       }
 
-      this.lib = this.koffi.load(dllPath)
-      this.initHook = this.lib.func('bool InitializeHook(uint32 targetPid)')
-      this.pollKeyData = this.lib.func('bool PollKeyData(_Out_ char *keyBuffer, int bufferSize)')
-      this.getStatusMessage = this.lib.func('bool GetStatusMessage(_Out_ char *msgBuffer, int bufferSize, _Out_ int *outLevel)')
-      this.cleanupHook = this.lib.func('bool CleanupHook()')
-      this.getLastErrorMsg = this.lib.func('const char* GetLastErrorMsg()')
-      this.getImageKeyDll = this.lib.func('bool GetImageKey(_Out_ char *resultBuffer, int bufferSize)')
+      const lib = this.koffi.load(dllPath)
+      this.dllCompatApi = {
+        initHook: lib.func('bool InitializeHook(uint32 targetPid)'),
+        pollKeyData: lib.func('bool PollKeyData(_Out_ char *keyBuffer, int bufferSize)'),
+        getStatusMessage: lib.func('bool GetStatusMessage(_Out_ char *msgBuffer, int bufferSize, _Out_ int *outLevel)'),
+        cleanupHook: lib.func('bool CleanupHook()'),
+        getLastErrorMsg: lib.func('const char* GetLastErrorMsg()')
+      }
 
-      this.initialized = true
       return true
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : String(e)
@@ -621,88 +620,6 @@ export class KeyService {
       onStatus?: (message: string, level: number) => void
   ): Promise<DbKeyResult> {
     return this._autoGetDbKeyChain(timeoutMs, onStatus)
-    if (!this.ensureWin32()) return { success: false, error: '仅支持 Windows' }
-    if (!this.ensureLoaded()) return { success: false, error: 'wx_key.dll 未加载' }
-    if (!this.ensureKernel32()) return { success: false, error: 'Kernel32 Init Failed' }
-
-    const logs: string[] = []
-
-    onStatus?.('正在查找微信进程...', 0)
-    const pid = await this.findWeChatPid()
-    if (!pid) {
-      const err = '未找到微信进程，请先启动微信'
-      onStatus?.(err, 2)
-      return { success: false, error: err }
-    }
-
-    onStatus?.(`检测到微信窗口 (PID: ${pid})，正在获取...`, 0)
-    onStatus?.('正在检测微信界面组件...', 0)
-    await this.waitForWeChatWindowComponents(pid, 15000)
-
-    const ok = this.initHook(pid)
-    if (!ok) {
-      const error = this.getLastErrorMsg ? this.decodeCString(this.getLastErrorMsg()) : ''
-      if (error) {
-        if (error.includes('0xC0000022') || error.includes('ACCESS_DENIED') || error.includes('打开目标进程失败')) {
-          const friendlyError = '权限不足：无法访问微信进程。\n\n解决方法：\n1. 右键 WeFlow 图标，选择"以管理员身份运行"\n2. 关闭可能拦截的安全软件（如360、火绒等）\n3. 确保微信没有以管理员权限运行'
-          return { success: false, error: friendlyError }
-        }
-        return { success: false, error }
-      }
-      const statusBuffer = Buffer.alloc(256)
-      const levelOut = [0]
-      const status = this.getStatusMessage && this.getStatusMessage(statusBuffer, statusBuffer.length, levelOut)
-          ? this.decodeUtf8(statusBuffer)
-          : ''
-      return { success: false, error: status || '初始化失败' }
-    }
-
-    const keyBuffer = Buffer.alloc(128)
-    const start = Date.now()
-    let loginRequiredDetected = false
-
-    try {
-      while (Date.now() - start < timeoutMs) {
-        if (this.pollKeyData(keyBuffer, keyBuffer.length)) {
-          const key = this.decodeUtf8(keyBuffer)
-          if (key.length === 64) {
-            onStatus?.('密钥获取成功', 1)
-            return { success: true, key, logs }
-          }
-        }
-
-        for (let i = 0; i < 5; i++) {
-          const statusBuffer = Buffer.alloc(256)
-          const levelOut = [0]
-          if (!this.getStatusMessage(statusBuffer, statusBuffer.length, levelOut)) break
-          const msg = this.decodeUtf8(statusBuffer)
-          const level = levelOut[0] ?? 0
-          if (msg) {
-            logs.push(msg)
-            if (this.isLoginRelatedText(msg)) {
-              loginRequiredDetected = true
-            }
-            onStatus?.(msg, level)
-          }
-        }
-        await new Promise((resolve) => setTimeout(resolve, 120))
-      }
-    } finally {
-      try {
-        this.cleanupHook()
-      } catch { }
-    }
-
-    const loginRequired = loginRequiredDetected || await this.detectWeChatLoginRequired(pid)
-    if (loginRequired) {
-      return {
-        success: false,
-        error: '微信已启动但尚未完成登录，请先在微信客户端完成登录后再重试自动获取密钥。',
-        logs
-      }
-    }
-
-    return { success: false, error: '获取密钥超时', logs }
   }
 
   private isHexKey(value: unknown): value is string {
@@ -2403,7 +2320,7 @@ export class KeyService {
     timeoutMs: number,
     onStatus?: (message: string, level: number) => void
   ): Promise<DbKeyResult> {
-    if (!this.ensureLoaded()) return { success: false, error: 'wx_key.dll 未加载' }
+    if (!this.ensureDllCompatLoaded()) return { success: false, error: 'wx_key.dll compatibility layer unavailable' }
     if (!this.ensureKernel32()) return { success: false, error: 'Kernel32 init failed' }
 
     const pid = await this.findWeChatPid()
@@ -2415,9 +2332,12 @@ export class KeyService {
     const loginRequiredBefore = await this.detectWeChatLoginRequired(pid)
     const readyBefore = await this.waitForWeChatWindowComponents(pid, 1500)
 
-    const initOk = this.initHook(pid)
+    const compat = this.dllCompatApi
+    if (!compat) return { success: false, error: 'wx_key.dll compatibility layer unavailable' }
+
+    const initOk = compat.initHook(pid)
     if (!initOk) {
-      const dllError = this.getLastErrorMsg ? this.decodeCString(this.getLastErrorMsg()) : ''
+      const dllError = compat.getLastErrorMsg ? this.decodeCString(compat.getLastErrorMsg()) : ''
       if (dllError.includes('0xC0000022') || dllError.includes('ACCESS_DENIED')) {
         return { success: false, error: '权限不足：无法访问微信进程，请尝试以管理员权限运行 WeFlow' }
       }
@@ -2439,19 +2359,19 @@ export class KeyService {
     try {
       const deadline = Date.now() + Math.max(timeoutMs, 5000)
       while (Date.now() < deadline) {
-        if (this.getStatusMessage) {
+        if (compat.getStatusMessage) {
           for (let i = 0; i < 5; i++) {
             const statusBuffer = Buffer.alloc(4096)
             const levelBuffer = Buffer.alloc(4)
-            const hasStatus = this.getStatusMessage(statusBuffer, statusBuffer.length, levelBuffer)
+            const hasStatus = compat.getStatusMessage(statusBuffer, statusBuffer.length, levelBuffer)
             if (!hasStatus) break
             pushStatus(this.decodeUtf8(statusBuffer), levelBuffer.readInt32LE(0))
           }
         }
 
-        if (this.pollKeyData) {
+        if (compat.pollKeyData) {
           const keyBuffer = Buffer.alloc(65536)
-          const ok = this.pollKeyData(keyBuffer, keyBuffer.length)
+          const ok = compat.pollKeyData(keyBuffer, keyBuffer.length)
           if (ok) {
             const parsed = this.parseDbKeyPayload(this.decodeUtf8(keyBuffer))
             if (parsed?.success) {
@@ -2465,7 +2385,7 @@ export class KeyService {
       }
     } finally {
       try {
-        this.cleanupHook()
+        compat.cleanupHook()
       } catch { }
     }
 
