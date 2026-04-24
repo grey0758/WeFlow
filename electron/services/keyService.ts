@@ -1,12 +1,11 @@
-import { app } from 'electron'
 import { join, dirname, basename } from 'path'
-import { existsSync, copyFileSync, mkdirSync, readdirSync, statSync } from 'fs'
+import { existsSync, readdirSync, statSync } from 'fs'
 import { execFile, spawn } from 'child_process'
 import { promisify } from 'util'
-import os from 'os'
 import crypto from 'crypto'
 import { pyWxDumpService } from './pyWxDumpService'
 import { dbPathService } from './dbPathService'
+import { KeyServiceDllCompat } from './keyServiceDllCompat'
 
 const execFileAsync = promisify(execFile)
 
@@ -20,18 +19,17 @@ type DbKeyResult = {
 }
 type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string }
 type DbVerificationTarget = { name: string; path: string; saltHex: string; markers: string[] }
-type WxKeyDllCompatApi = {
-  initHook: (pid: number) => boolean
-  pollKeyData: (buffer: Buffer, bufferSize: number) => boolean
-  getStatusMessage: (buffer: Buffer, bufferSize: number, outLevel: Buffer) => boolean
-  cleanupHook: () => boolean
-  getLastErrorMsg: (() => Buffer | string | null | undefined) | null
-}
 
 export class KeyService {
   private readonly isMac = process.platform === 'darwin'
   private koffi: any = null
-  private dllCompatApi: WxKeyDllCompatApi | null = null
+  private readonly dllCompat = new KeyServiceDllCompat({
+    ensureKernel32: () => this.ensureKernel32(),
+    findWeChatPid: () => this.findWeChatPid(),
+    detectWeChatLoginRequired: (pid) => this.detectWeChatLoginRequired(pid),
+    waitForWeChatWindowComponents: (pid, timeoutMs) => this.waitForWeChatWindowComponents(pid, timeoutMs),
+    normalizeWcdbKeys: (value) => this.normalizeWcdbKeys(value)
+  })
 
   // Win32 APIs
   private kernel32: any = null
@@ -68,95 +66,6 @@ export class KeyService {
   private readonly HKEY_CURRENT_USER = 0x80000001
   private readonly ERROR_SUCCESS = 0
   private readonly WM_CLOSE = 0x0010
-
-  // Optional wx_key.dll compatibility layer. The default DB/image flows do not depend on it.
-  private getDllPath(): string {
-    const isPackaged = typeof app !== 'undefined' && app ? app.isPackaged : process.env.NODE_ENV === 'production'
-    const archDir = process.arch === 'arm64' ? 'arm64' : 'x64'
-    const candidates: string[] = []
-
-    if (process.env.WX_KEY_DLL_PATH) {
-      candidates.push(process.env.WX_KEY_DLL_PATH)
-    }
-
-    if (isPackaged) {
-      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
-      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
-      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', 'wx_key.dll'))
-      candidates.push(join(process.resourcesPath, 'resources', 'wx_key.dll'))
-      candidates.push(join(process.resourcesPath, 'wx_key.dll'))
-    } else {
-      const cwd = process.cwd()
-      candidates.push(join(cwd, 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
-      candidates.push(join(cwd, 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
-      candidates.push(join(cwd, 'resources', 'key', 'win32', 'wx_key.dll'))
-      candidates.push(join(cwd, 'resources', 'wx_key.dll'))
-      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
-      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
-      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', 'wx_key.dll'))
-      candidates.push(join(app.getAppPath(), 'resources', 'wx_key.dll'))
-    }
-
-    for (const path of candidates) {
-      if (existsSync(path)) return path
-    }
-
-    return candidates[0]
-  }
-
-  private isNetworkPath(path: string): boolean {
-    if (path.startsWith('\\\\')) return true
-    return false
-  }
-
-  private localizeNetworkDll(originalPath: string): string {
-    try {
-      const tempDir = join(os.tmpdir(), 'weflow_dll_cache')
-      if (!existsSync(tempDir)) {
-        mkdirSync(tempDir, { recursive: true })
-      }
-      const localPath = join(tempDir, 'wx_key.dll')
-      if (existsSync(localPath)) return localPath
-
-      copyFileSync(originalPath, localPath)
-      return localPath
-    } catch (e) {
-      console.error('DLL 本地化失败:', e)
-      return originalPath
-    }
-  }
-
-  private ensureDllCompatLoaded(): boolean {
-    if (this.dllCompatApi) return true
-
-    let dllPath = ''
-    try {
-      this.koffi = require('koffi')
-      dllPath = this.getDllPath()
-      if (!existsSync(dllPath)) {
-        return false
-      }
-
-      if (this.isNetworkPath(dllPath)) {
-        dllPath = this.localizeNetworkDll(dllPath)
-      }
-
-      const lib = this.koffi.load(dllPath)
-      this.dllCompatApi = {
-        initHook: lib.func('bool InitializeHook(uint32 targetPid)'),
-        pollKeyData: lib.func('bool PollKeyData(_Out_ char *keyBuffer, int bufferSize)'),
-        getStatusMessage: lib.func('bool GetStatusMessage(_Out_ char *msgBuffer, int bufferSize, _Out_ int *outLevel)'),
-        cleanupHook: lib.func('bool CleanupHook()'),
-        getLastErrorMsg: lib.func('const char* GetLastErrorMsg()')
-      }
-
-      return true
-    } catch (e) {
-      const errorMsg = e instanceof Error ? e.message : String(e)
-      console.error(`加载 wx_key.dll 失败\n  路径: ${dllPath}\n  错误: ${errorMsg}`)
-      return false
-    }
-  }
 
   private ensureWin32(): boolean {
     return process.platform === 'win32'
@@ -226,15 +135,6 @@ export class KeyService {
     } catch (e) {
       console.error('初始化 advapi32 失败:', e)
       return false
-    }
-  }
-
-  private decodeCString(ptr: any): string {
-    try {
-      if (typeof ptr === 'string') return ptr
-      return this.koffi.decode(ptr, 'char', -1)
-    } catch {
-      return ''
     }
   }
 
@@ -637,44 +537,6 @@ export class KeyService {
       result[normalizedSalt] = normalizedKey
     }
     return Object.keys(result).length > 0 ? result : undefined
-  }
-
-  private parseDbKeyPayload(raw: string): DbKeyResult | null {
-    const trimmed = String(raw || '').trim()
-    if (!trimmed) return null
-
-    if (this.isHexKey(trimmed)) {
-      return { success: true, key: trimmed.toLowerCase(), source: 'dll' }
-    }
-
-    let parsed: any = null
-    try {
-      parsed = JSON.parse(trimmed)
-    } catch {
-      return null
-    }
-
-    const directWcdbKeys = this.normalizeWcdbKeys(parsed?.wcdb_keys ?? parsed?.wcdbKeys)
-    if (directWcdbKeys) {
-      return { success: true, wcdbKeys: directWcdbKeys, source: 'dll' }
-    }
-
-    if (this.isHexKey(parsed?.key)) {
-      return { success: true, key: String(parsed.key).trim().toLowerCase(), source: 'dll' }
-    }
-
-    const accounts = Array.isArray(parsed?.accounts) ? parsed.accounts : []
-    for (const account of accounts) {
-      const wcdbKeys = this.normalizeWcdbKeys(account?.wcdb_keys ?? account?.wcdbKeys)
-      if (wcdbKeys) {
-        return { success: true, wcdbKeys, source: 'dll' }
-      }
-      if (this.isHexKey(account?.key)) {
-        return { success: true, key: String(account.key).trim().toLowerCase(), source: 'dll' }
-      }
-    }
-
-    return null
   }
 
   private verifyLegacyDbKeyHex(keyHex: string, dbPath: string): boolean {
@@ -2316,101 +2178,11 @@ export class KeyService {
     return mergedKeys
   }
 
-  private async _getDbKeyViaDll(
+  private async getDbKeyViaDllCompat(
     timeoutMs: number,
     onStatus?: (message: string, level: number) => void
   ): Promise<DbKeyResult> {
-    if (!this.ensureDllCompatLoaded()) return { success: false, error: 'wx_key.dll compatibility layer unavailable' }
-    if (!this.ensureKernel32()) return { success: false, error: 'Kernel32 init failed' }
-
-    const pid = await this.findWeChatPid()
-    if (!pid) {
-      return { success: false, error: '未找到微信进程，请先启动微信' }
-    }
-
-    onStatus?.(`DLL fallback: attaching to pid ${pid}`, 0)
-    const loginRequiredBefore = await this.detectWeChatLoginRequired(pid)
-    const readyBefore = await this.waitForWeChatWindowComponents(pid, 1500)
-
-    const compat = this.dllCompatApi
-    if (!compat) return { success: false, error: 'wx_key.dll compatibility layer unavailable' }
-
-    const initOk = compat.initHook(pid)
-    if (!initOk) {
-      const dllError = compat.getLastErrorMsg ? this.decodeCString(compat.getLastErrorMsg()) : ''
-      if (dllError.includes('0xC0000022') || dllError.includes('ACCESS_DENIED')) {
-        return { success: false, error: '权限不足：无法访问微信进程，请尝试以管理员权限运行 WeFlow' }
-      }
-      return { success: false, error: dllError || '初始化微信取钥 Hook 失败' }
-    }
-
-    const logs: string[] = []
-    const seenStatus = new Set<string>()
-    const pushStatus = (message: string, level: number) => {
-      const normalized = String(message || '').trim()
-      if (!normalized) return
-      const marker = `${level}:${normalized}`
-      if (seenStatus.has(marker)) return
-      seenStatus.add(marker)
-      logs.push(normalized)
-      onStatus?.(normalized, level)
-    }
-
-    try {
-      const deadline = Date.now() + Math.max(timeoutMs, 5000)
-      while (Date.now() < deadline) {
-        if (compat.getStatusMessage) {
-          for (let i = 0; i < 5; i++) {
-            const statusBuffer = Buffer.alloc(4096)
-            const levelBuffer = Buffer.alloc(4)
-            const hasStatus = compat.getStatusMessage(statusBuffer, statusBuffer.length, levelBuffer)
-            if (!hasStatus) break
-            pushStatus(this.decodeUtf8(statusBuffer), levelBuffer.readInt32LE(0))
-          }
-        }
-
-        if (compat.pollKeyData) {
-          const keyBuffer = Buffer.alloc(65536)
-          const ok = compat.pollKeyData(keyBuffer, keyBuffer.length)
-          if (ok) {
-            const parsed = this.parseDbKeyPayload(this.decodeUtf8(keyBuffer))
-            if (parsed?.success) {
-              return { ...parsed, logs, source: 'dll' }
-            }
-            return { success: false, error: 'wx_key.dll 返回了无法识别的密钥格式', logs }
-          }
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 150))
-      }
-    } finally {
-      try {
-        compat.cleanupHook()
-      } catch { }
-    }
-
-    const loginRequiredAfter = await this.detectWeChatLoginRequired(pid)
-    if (!loginRequiredBefore && !loginRequiredAfter && readyBefore) {
-      return {
-        success: false,
-        error: '当前微信已处于登录后的运行态，DLL 取钥需要在登录过程中抓取。请退出并重新登录微信后再试。',
-        logs
-      }
-    }
-
-    if (loginRequiredBefore || loginRequiredAfter) {
-      return {
-        success: false,
-        error: '微信尚未完成登录，请先完成登录后重试自动取钥。',
-        logs
-      }
-    }
-
-    return {
-      success: false,
-      error: '等待微信返回数据库密钥超时，请在微信登录过程中重试。',
-      logs
-    }
+    return this.dllCompat.getDbKey(timeoutMs, onStatus)
   }
 
   private async _autoGetDbKeyChain(
