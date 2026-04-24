@@ -29,6 +29,8 @@ interface DbRuntimeStatus {
   fallbackMode: boolean
   dllAvailable: boolean
   dllInitError: string | null
+  mode: 'native' | 'dll'
+  dllCompatEnabled: boolean
 }
 
 const formatDbKeyFailureMessage = (error?: string, logs?: string[]): string => {
@@ -55,20 +57,23 @@ const getDbKeySourceLabel = (source?: 'pywxdump' | 'native' | 'dll'): string => 
 
 const isExpiredDllFallback = (status?: DbRuntimeStatus | null): boolean => {
   const error = String(status?.dllInitError || '')
-  return Boolean(status?.fallbackMode && error.includes('WCDB DLL 已过期并触发自毁'))
+  return Boolean(status?.dllCompatEnabled && status?.fallbackMode && error.includes('WCDB DLL 已过期并触发自毁'))
 }
 
 const formatDbRuntimeStatus = (status?: DbRuntimeStatus | null): string => {
   if (!status?.initialized) return ''
+  if (status.mode === 'dll') {
+    return '当前数据库运行模式：WCDB DLL 兼容层。'
+  }
   if (isExpiredDllFallback(status)) {
-    return '当前数据库运行模式：自有 fallback。内置 WCDB DLL 已过期并返回 -1000，但已自动切到自有链路，当前读取和导出可继续使用。'
+    return '当前数据库运行模式：自有链路。WCDB DLL 兼容层已过期并返回 -1000，当前已自动回退到自有链路，读取和导出可继续使用。'
   }
-  if (status.fallbackMode) {
+  if (status.dllCompatEnabled && status.fallbackMode) {
     return status.dllInitError
-      ? `当前数据库运行模式：自有 fallback。DLL 状态：${status.dllInitError}`
-      : '当前数据库运行模式：自有 fallback。当前读取链路可继续使用。'
+      ? `当前数据库运行模式：自有链路。WCDB DLL 兼容层状态：${status.dllInitError}`
+      : '当前数据库运行模式：自有链路。WCDB DLL 兼容层未接管，当前读取链路可继续使用。'
   }
-  return '当前数据库运行模式：WCDB DLL 直连。'
+  return '当前数据库运行模式：自有链路（默认）。未启用 WCDB DLL 兼容层。'
 }
 
 function WelcomePage({ standalone = false }: WelcomePageProps) {

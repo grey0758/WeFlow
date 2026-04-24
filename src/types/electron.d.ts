@@ -144,6 +144,8 @@ export interface ElectronAPI {
       fallbackMode: boolean
       dllAvailable: boolean
       dllInitError: string | null
+      mode: 'native' | 'dll'
+      dllCompatEnabled: boolean
     }>
   }
   key: {

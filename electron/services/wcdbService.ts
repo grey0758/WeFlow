@@ -182,6 +182,8 @@ export class WcdbService {
     fallbackMode: boolean
     dllAvailable: boolean
     dllInitError: string | null
+    mode: 'native' | 'dll'
+    dllCompatEnabled: boolean
   }> {
     return this.callWorker('getRuntimeStatus')
   }

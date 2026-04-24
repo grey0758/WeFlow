@@ -3,6 +3,12 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, readFileS
 import { tmpdir } from 'os'
 import { pyWxDumpService } from './pyWxDumpService'
 import { nativeSqlcipherService } from './nativeSqlcipherService'
+import {
+  WCDB_DLL_COMPAT_BINDING_KEYS,
+  initializeWcdbDllCompat,
+  readWcdbDllCompatLogs,
+  type WcdbDllCompatBindings
+} from './wcdbCoreDllCompat'
 
 // DLL 初始化错误信息，用于帮助用户诊断问题
 let lastDllInitError: string | null = null
@@ -61,6 +67,9 @@ export class WcdbCore {
   private resourcesPath: string | null = null
   private userDataPath: string | null = null
   private logEnabled = false
+  private readonly dllCompatEnabled = process.env.WCDB_ENABLE_DLL_COMPAT === '1'
+  private runtimeMode: 'native' | 'dll' = 'native'
+  private dllCompatBindings: WcdbDllCompatBindings | null = null
   private lib: any = null
   private koffi: any = null
   private initialized = false
@@ -287,46 +296,6 @@ export class WcdbCore {
   setMonitor(callback: (type: string, json: string) => void): boolean {
     return this.startMonitor(callback)
   }
-
-
-
-  /**
-   * 获取库文件路径（跨平台）
-   */
-  private getDllPath(): string {
-    const isMac = process.platform === 'darwin'
-    const libName = isMac ? 'libwcdb_api.dylib' : 'wcdb_api.dll'
-    const subDir = isMac ? 'macos' : ''
-    
-    const envDllPath = process.env.WCDB_DLL_PATH
-    if (envDllPath && envDllPath.length > 0) {
-      return envDllPath
-    }
-
-    // 基础路径探测
-    const isPackaged = typeof process['resourcesPath'] !== 'undefined'
-    const resourcesPath = isPackaged ? process.resourcesPath : join(process.cwd(), 'resources')
-
-    const candidates = [
-      // 环境变量指定 resource 目录
-      process.env.WCDB_RESOURCES_PATH ? join(process.env.WCDB_RESOURCES_PATH, subDir, libName) : null,
-      // 显式 setPaths 设置的路径
-      this.resourcesPath ? join(this.resourcesPath, subDir, libName) : null,
-      // resources/macos/libwcdb_api.dylib 或 resources/wcdb_api.dll
-      join(resourcesPath, 'resources', subDir, libName),
-      // resources/libwcdb_api.dylib 或 resources/wcdb_api.dll (扁平结构)
-      join(resourcesPath, subDir, libName),
-      // CWD fallback
-      join(process.cwd(), 'resources', subDir, libName)
-    ].filter(Boolean) as string[]
-
-    for (const path of candidates) {
-      if (existsSync(path)) return path
-    }
-
-    return candidates[0] || libName
-  }
-
   private isLogEnabled(): boolean {
     // 移除 Worker 线程的日志禁用逻辑，允许在 Worker 中记录日志
     if (process.env.WCDB_LOG_ENABLED === '1') return true
@@ -365,54 +334,11 @@ export class WcdbCore {
     return compact.slice(0, maxLen) + '...'
   }
 
-  private readNativeLogs(): string[] {
-    try {
-      if (!this.wcdbGetLogs) return []
-      const outPtr = [null as any]
-      const result = this.wcdbGetLogs(outPtr)
-      if (result !== 0 || !outPtr[0]) return []
-
-      let jsonStr = ''
-      try {
-        jsonStr = this.koffi.decode(outPtr[0], 'char', -1)
-      } finally {
-        try { this.wcdbFreeString(outPtr[0]) } catch { }
-      }
-
-      if (!jsonStr) return []
-      try {
-        const parsed = JSON.parse(jsonStr)
-        if (Array.isArray(parsed)) {
-          return parsed.map((item) => String(item || '')).filter(Boolean)
-        }
-      } catch {
-        // ignore JSON parse error and fall through to raw text
-      }
-
-      return [jsonStr]
-    } catch {
-      return []
+  private clearDllCompatState(): void {
+    this.dllCompatBindings = null
+    for (const key of WCDB_DLL_COMPAT_BINDING_KEYS) {
+      ;(this as any)[key] = null
     }
-  }
-
-  private describeDllInitFailure(initResult: number, logs: string[]): string {
-    const joined = logs.join(' | ')
-    const lower = joined.toLowerCase()
-    const execName = basename(process.execPath || process.argv[0] || '')
-
-    if (lower.includes('expired: self-destruct triggered')) {
-      return `WCDB DLL 已过期并触发自毁（错误码: ${initResult}，进程: ${execName}）。当前 resources/wcdb_api.dll 已不可用，需要替换 DLL 或彻底切到纯自有实现。`
-    }
-
-    if (lower.includes('securitystatus:2') || lower.includes('security verification failed')) {
-      return `WCDB DLL 安全校验失败（错误码: ${initResult}，进程: ${execName}）。当前进程名或运行形态未通过 DLL 校验。`
-    }
-
-    if (joined) {
-      return `WCDB 初始化失败（错误码: ${initResult}）。原生日志: ${joined}`
-    }
-
-    return `初始化失败（错误码: ${initResult}）`
   }
 
   getRuntimeStatus(): {
@@ -420,12 +346,16 @@ export class WcdbCore {
     fallbackMode: boolean
     dllAvailable: boolean
     dllInitError: string | null
+    mode: 'native' | 'dll'
+    dllCompatEnabled: boolean
   } {
     return {
       initialized: this.initialized,
       fallbackMode: this.fallbackMode,
-      dllAvailable: this.initialized && !this.fallbackMode,
-      dllInitError: lastDllInitError
+      dllAvailable: this.initialized && this.dllCompatEnabled && !this.fallbackMode,
+      dllInitError: lastDllInitError,
+      mode: this.runtimeMode,
+      dllCompatEnabled: this.dllCompatEnabled
     }
   }
 
@@ -618,421 +548,63 @@ export class WcdbCore {
   async initialize(): Promise<boolean> {
     if (this.initialized) return true
 
-    try {
-      this.koffi = require('koffi')
-      const dllPath = this.getDllPath()
-      this.writeLog(`[bootstrap] initialize platform=${process.platform} execPath=${process.execPath || ''} dllPath=${dllPath} resourcesPath=${this.resourcesPath || ''} userDataPath=${this.userDataPath || ''}`, true)
-
-      if (!existsSync(dllPath)) {
-        lastDllInitError = `WCDB DLL 文件缺失（${dllPath}）。已切换到自有 fallback，可继续读取和导出。`
-        console.warn('WCDB DLL 不存在，已切换到自有 fallback:', dllPath)
-        this.writeLog(`[bootstrap] initialize: dll not found path=${dllPath}; fallback remains usable`, true)
-        this.fallbackMode = true
-        this.initialized = true
-        return true
-      }
-
-      const dllDir = dirname(dllPath)
-      const isMac = process.platform === 'darwin'
-      
-      // 预加载依赖库
-      if (isMac) {
-        const wcdbCorePath = join(dllDir, 'libWCDB.dylib')
-        if (existsSync(wcdbCorePath)) {
-          try {
-            this.koffi.load(wcdbCorePath)
-            this.writeLog('预加载 libWCDB.dylib 成功')
-          } catch (e) {
-            console.warn('预加载 libWCDB.dylib 失败(可能不是致命的):', e)
-            this.writeLog(`预加载 libWCDB.dylib 失败: ${String(e)}`)
-          }
-        }
-      } else {
-        const wcdbCorePath = join(dllDir, 'WCDB.dll')
-        if (existsSync(wcdbCorePath)) {
-          try {
-            this.koffi.load(wcdbCorePath)
-            this.writeLog('预加载 WCDB.dll 成功')
-          } catch (e) {
-            console.warn('预加载 WCDB.dll 失败(可能不是致命的):', e)
-            this.writeLog(`预加载 WCDB.dll 失败: ${String(e)}`)
-          }
-        }
-        const sdl2Path = join(dllDir, 'SDL2.dll')
-        if (existsSync(sdl2Path)) {
-          try {
-            this.koffi.load(sdl2Path)
-            this.writeLog('预加载 SDL2.dll 成功')
-          } catch (e) {
-            console.warn('预加载 SDL2.dll 失败(可能不是致命的):', e)
-            this.writeLog(`预加载 SDL2.dll 失败: ${String(e)}`)
-          }
-        }
-      }
-
-      this.lib = this.koffi.load(dllPath)
-
-      // InitProtection (Added for security)
-      try {
-        this.wcdbInitProtection = this.lib.func('bool InitProtection(const char* resourcePath)')
-
-        // 尝试多个可能的资源路径
-        const resourcePaths = [
-          dllDir,  // DLL 所在目录
-          dirname(dllDir),  // 上级目录
-          process.resourcesPath,  // 打包后 Contents/Resources
-          process.resourcesPath ? join(process.resourcesPath as string, 'resources') : null,  // Contents/Resources/resources
-          this.resourcesPath,  // 配置的资源路径
-          join(process.cwd(), 'resources')  // 开发环境
-        ].filter(Boolean)
-
-        let protectionOk = false
-        for (const resPath of resourcePaths) {
-          try {
-            protectionOk = this.wcdbInitProtection(resPath)
-            this.writeLog(`[bootstrap] InitProtection(${resPath}) => ${protectionOk ? 'ok' : 'fail'}`, true)
-            if (protectionOk) {
-              break
-            }
-          } catch (e) {
-            this.writeLog(`[bootstrap] InitProtection exception (${resPath}): ${String(e)}`, true)
-          }
-        }
-
-        if (!protectionOk) {
-          this.writeLog('[bootstrap] InitProtection failed for all candidate paths, continuing anyway', true)
-        }
-      } catch (e) {
-        this.writeLog(`[bootstrap] InitProtection symbol unavailable: ${String(e)}`, true)
-      }
-
-      // 定义类型
-      // wcdb_status wcdb_init()
-      this.wcdbInit = this.lib.func('int32 wcdb_init()')
-
-      // wcdb_status wcdb_shutdown()
-      this.wcdbShutdown = this.lib.func('int32 wcdb_shutdown()')
-
-      // wcdb_status wcdb_open_account(const char* session_db_path, const char* hex_key, wcdb_handle* out_handle)
-      // wcdb_handle 是 int64_t
-      this.wcdbOpenAccount = this.lib.func('int32 wcdb_open_account(const char* path, const char* key, _Out_ int64* handle)')
-
-      // wcdb_status wcdb_close_account(wcdb_handle handle)
-      //  C 接口是 int64， koffi 返回 handle 是 number 类型
-      this.wcdbCloseAccount = this.lib.func('int32 wcdb_close_account(int64 handle)')
-
-      // wcdb_status wcdb_set_my_wxid(wcdb_handle handle, const char* wxid)
-      try {
-        this.wcdbSetMyWxid = this.lib.func('int32 wcdb_set_my_wxid(int64 handle, const char* wxid)')
-      } catch {
-        this.wcdbSetMyWxid = null
-      }
-
-      // wcdb_status wcdb_update_message(wcdb_handle handle, const char* session_id, int64_t local_id, int32_t create_time, const char* new_content, char** out_error)
-      try {
-        this.wcdbUpdateMessage = this.lib.func('int32 wcdb_update_message(int64 handle, const char* sessionId, int64 localId, int32 createTime, const char* newContent, _Out_ void** outError)')
-      } catch {
-        this.wcdbUpdateMessage = null
-      }
-
-      // wcdb_status wcdb_delete_message(wcdb_handle handle, const char* session_id, int64_t local_id, char** out_error)
-      try {
-        this.wcdbDeleteMessage = this.lib.func('int32 wcdb_delete_message(int64 handle, const char* sessionId, int64 localId, int32 createTime, const char* dbPathHint, _Out_ void** outError)')
-      } catch {
-        this.wcdbDeleteMessage = null
-      }
-
-      // void wcdb_free_string(char* ptr)
-      this.wcdbFreeString = this.lib.func('void wcdb_free_string(void* ptr)')
-
-      // wcdb_status wcdb_get_sessions(wcdb_handle handle, char** out_json)
-      this.wcdbGetSessions = this.lib.func('int32 wcdb_get_sessions(int64 handle, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_messages(wcdb_handle handle, const char* username, int32_t limit, int32_t offset, char** out_json)
-      this.wcdbGetMessages = this.lib.func('int32 wcdb_get_messages(int64 handle, const char* username, int32 limit, int32 offset, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_message_count(wcdb_handle handle, const char* username, int32_t* out_count)
-      this.wcdbGetMessageCount = this.lib.func('int32 wcdb_get_message_count(int64 handle, const char* username, _Out_ int32* outCount)')
-
-      // wcdb_status wcdb_get_display_names(wcdb_handle handle, const char* usernames_json, char** out_json)
-      this.wcdbGetDisplayNames = this.lib.func('int32 wcdb_get_display_names(int64 handle, const char* usernamesJson, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_avatar_urls(wcdb_handle handle, const char* usernames_json, char** out_json)
-      this.wcdbGetAvatarUrls = this.lib.func('int32 wcdb_get_avatar_urls(int64 handle, const char* usernamesJson, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_group_member_count(wcdb_handle handle, const char* chatroom_id, int32_t* out_count)
-      this.wcdbGetGroupMemberCount = this.lib.func('int32 wcdb_get_group_member_count(int64 handle, const char* chatroomId, _Out_ int32* outCount)')
-
-      // wcdb_status wcdb_get_group_member_counts(wcdb_handle handle, const char* chatroom_ids_json, char** out_json)
-      try {
-        this.wcdbGetGroupMemberCounts = this.lib.func('int32 wcdb_get_group_member_counts(int64 handle, const char* chatroomIdsJson, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetGroupMemberCounts = null
-      }
-
-      // wcdb_status wcdb_get_group_members(wcdb_handle handle, const char* chatroom_id, char** out_json)
-      this.wcdbGetGroupMembers = this.lib.func('int32 wcdb_get_group_members(int64 handle, const char* chatroomId, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_group_nicknames(wcdb_handle handle, const char* chatroom_id, char** out_json)
-      try {
-        this.wcdbGetGroupNicknames = this.lib.func('int32 wcdb_get_group_nicknames(int64 handle, const char* chatroomId, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetGroupNicknames = null
-      }
-
-      // wcdb_status wcdb_get_message_tables(wcdb_handle handle, const char* session_id, char** out_json)
-      this.wcdbGetMessageTables = this.lib.func('int32 wcdb_get_message_tables(int64 handle, const char* sessionId, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_message_meta(wcdb_handle handle, const char* db_path, const char* table_name, int32_t limit, int32_t offset, char** out_json)
-      this.wcdbGetMessageMeta = this.lib.func('int32 wcdb_get_message_meta(int64 handle, const char* dbPath, const char* tableName, int32 limit, int32 offset, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_contact(wcdb_handle handle, const char* username, char** out_json)
-      this.wcdbGetContact = this.lib.func('int32 wcdb_get_contact(int64 handle, const char* username, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_contact_status(wcdb_handle handle, const char* usernames_json, char** out_json)
-      try {
-        this.wcdbGetContactStatus = this.lib.func('int32 wcdb_get_contact_status(int64 handle, const char* usernamesJson, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetContactStatus = null
-      }
-
-      // wcdb_status wcdb_get_message_table_stats(wcdb_handle handle, const char* session_id, char** out_json)
-      this.wcdbGetMessageTableStats = this.lib.func('int32 wcdb_get_message_table_stats(int64 handle, const char* sessionId, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_aggregate_stats(wcdb_handle handle, const char* session_ids_json, int32_t begin_timestamp, int32_t end_timestamp, char** out_json)
-      this.wcdbGetAggregateStats = this.lib.func('int32 wcdb_get_aggregate_stats(int64 handle, const char* sessionIdsJson, int32 begin, int32 end, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_available_years(wcdb_handle handle, const char* session_ids_json, char** out_json)
-      try {
-        this.wcdbGetAvailableYears = this.lib.func('int32 wcdb_get_available_years(int64 handle, const char* sessionIdsJson, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetAvailableYears = null
-      }
-
-      // wcdb_status wcdb_get_annual_report_stats(wcdb_handle handle, const char* session_ids_json, int32_t begin_timestamp, int32_t end_timestamp, char** out_json)
-      try {
-        this.wcdbGetAnnualReportStats = this.lib.func('int32 wcdb_get_annual_report_stats(int64 handle, const char* sessionIdsJson, int32 begin, int32 end, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetAnnualReportStats = null
-      }
-
-      // wcdb_status wcdb_get_annual_report_extras(wcdb_handle handle, const char* session_ids_json, int32_t begin_timestamp, int32_t end_timestamp, int32_t peak_day_begin, int32_t peak_day_end, char** out_json)
-      try {
-        this.wcdbGetAnnualReportExtras = this.lib.func('int32 wcdb_get_annual_report_extras(int64 handle, const char* sessionIdsJson, int32 begin, int32 end, int32 peakBegin, int32 peakEnd, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetAnnualReportExtras = null
-      }
-
-      // wcdb_status wcdb_get_dual_report_stats(wcdb_handle handle, const char* session_id, int32_t begin_timestamp, int32_t end_timestamp, char** out_json)
-      try {
-        this.wcdbGetDualReportStats = this.lib.func('int32 wcdb_get_dual_report_stats(int64 handle, const char* sessionId, int32 begin, int32 end, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetDualReportStats = null
-      }
-
-      // wcdb_status wcdb_get_logs(char** out_json)
-      try {
-        this.wcdbGetLogs = this.lib.func('int32 wcdb_get_logs(_Out_ void** outJson)')
-      } catch {
-        this.wcdbGetLogs = null
-      }
-
-      // wcdb_status wcdb_get_group_stats(wcdb_handle handle, const char* chatroom_id, int32_t begin_timestamp, int32_t end_timestamp, char** out_json)
-      try {
-        this.wcdbGetGroupStats = this.lib.func('int32 wcdb_get_group_stats(int64 handle, const char* chatroomId, int32 begin, int32 end, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetGroupStats = null
-      }
-
-      // wcdb_status wcdb_get_message_dates(wcdb_handle handle, const char* session_id, char** out_json)
-      try {
-        this.wcdbGetMessageDates = this.lib.func('int32 wcdb_get_message_dates(int64 handle, const char* sessionId, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetMessageDates = null
-      }
-
-      // wcdb_status wcdb_open_message_cursor(wcdb_handle handle, const char* session_id, int32_t batch_size, int32_t ascending, int32_t begin_timestamp, int32_t end_timestamp, wcdb_cursor* out_cursor)
-      this.wcdbOpenMessageCursor = this.lib.func('int32 wcdb_open_message_cursor(int64 handle, const char* sessionId, int32 batchSize, int32 ascending, int32 beginTimestamp, int32 endTimestamp, _Out_ int64* outCursor)')
-
-      // wcdb_status wcdb_open_message_cursor_lite(wcdb_handle handle, const char* session_id, int32_t batch_size, int32_t ascending, int32_t begin_timestamp, int32_t end_timestamp, wcdb_cursor* out_cursor)
-      try {
-        this.wcdbOpenMessageCursorLite = this.lib.func('int32 wcdb_open_message_cursor_lite(int64 handle, const char* sessionId, int32 batchSize, int32 ascending, int32 beginTimestamp, int32 endTimestamp, _Out_ int64* outCursor)')
-      } catch {
-        this.wcdbOpenMessageCursorLite = null
-      }
-
-      // wcdb_status wcdb_fetch_message_batch(wcdb_handle handle, wcdb_cursor cursor, char** out_json, int32_t* out_has_more)
-      this.wcdbFetchMessageBatch = this.lib.func('int32 wcdb_fetch_message_batch(int64 handle, int64 cursor, _Out_ void** outJson, _Out_ int32* outHasMore)')
-
-      // wcdb_status wcdb_close_message_cursor(wcdb_handle handle, wcdb_cursor cursor)
-      this.wcdbCloseMessageCursor = this.lib.func('int32 wcdb_close_message_cursor(int64 handle, int64 cursor)')
-
-      // wcdb_status wcdb_get_logs(char** out_json)
-      this.wcdbGetLogs = this.lib.func('int32 wcdb_get_logs(_Out_ void** outJson)')
-
-      // wcdb_status wcdb_exec_query(wcdb_handle handle, const char* db_kind, const char* db_path, const char* sql, char** out_json)
-      this.wcdbExecQuery = this.lib.func('int32 wcdb_exec_query(int64 handle, const char* kind, const char* path, const char* sql, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_emoticon_cdn_url(wcdb_handle handle, const char* db_path, const char* md5, char** out_url)
-      this.wcdbGetEmoticonCdnUrl = this.lib.func('int32 wcdb_get_emoticon_cdn_url(int64 handle, const char* dbPath, const char* md5, _Out_ void** outUrl)')
-
-      // wcdb_status wcdb_list_message_dbs(wcdb_handle handle, char** out_json)
-      this.wcdbListMessageDbs = this.lib.func('int32 wcdb_list_message_dbs(int64 handle, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_list_media_dbs(wcdb_handle handle, char** out_json)
-      this.wcdbListMediaDbs = this.lib.func('int32 wcdb_list_media_dbs(int64 handle, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_message_by_id(wcdb_handle handle, const char* session_id, int32 local_id, char** out_json)
-      this.wcdbGetMessageById = this.lib.func('int32 wcdb_get_message_by_id(int64 handle, const char* sessionId, int32 localId, _Out_ void** outJson)')
-
-      // wcdb_status wcdb_get_db_status(wcdb_handle handle, char** out_json)
-      try {
-        this.wcdbGetDbStatus = this.lib.func('int32 wcdb_get_db_status(int64 handle, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetDbStatus = null
-      }
-
-      // wcdb_status wcdb_get_voice_data(wcdb_handle handle, const char* session_id, int32_t create_time, int32_t local_id, int64_t svr_id, const char* candidates_json, char** out_hex)
-      try {
-        this.wcdbGetVoiceData = this.lib.func('int32 wcdb_get_voice_data(int64 handle, const char* sessionId, int32 createTime, int32 localId, int64 svrId, const char* candidatesJson, _Out_ void** outHex)')
-      } catch {
-        this.wcdbGetVoiceData = null
-      }
-
-      // wcdb_status wcdb_search_messages(wcdb_handle handle, const char* session_id, const char* keyword, int32_t limit, int32_t offset, int32_t begin_timestamp, int32_t end_timestamp, char** out_json)
-      try {
-        this.wcdbSearchMessages = this.lib.func('int32 wcdb_search_messages(int64 handle, const char* sessionId, const char* keyword, int32 limit, int32 offset, int32 beginTimestamp, int32 endTimestamp, _Out_ void** outJson)')
-      } catch {
-        this.wcdbSearchMessages = null
-      }
-
-      // wcdb_status wcdb_get_sns_timeline(wcdb_handle handle, int32_t limit, int32_t offset, const char* username, const char* keyword, int32_t start_time, int32_t end_time, char** out_json)
-      try {
-        this.wcdbGetSnsTimeline = this.lib.func('int32 wcdb_get_sns_timeline(int64 handle, int32 limit, int32 offset, const char* username, const char* keyword, int32 startTime, int32 endTime, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetSnsTimeline = null
-      }
-
-      // wcdb_status wcdb_get_sns_annual_stats(wcdb_handle handle, int32_t begin_timestamp, int32_t end_timestamp, char** out_json)
-      try {
-        this.wcdbGetSnsAnnualStats = this.lib.func('int32 wcdb_get_sns_annual_stats(int64 handle, int32 begin, int32 end, _Out_ void** outJson)')
-      } catch {
-        this.wcdbGetSnsAnnualStats = null
-      }
-
-      // wcdb_status wcdb_install_sns_block_delete_trigger(wcdb_handle handle, char** out_error)
-      try {
-        this.wcdbInstallSnsBlockDeleteTrigger = this.lib.func('int32 wcdb_install_sns_block_delete_trigger(int64 handle, _Out_ void** outError)')
-      } catch {
-        this.wcdbInstallSnsBlockDeleteTrigger = null
-      }
-
-      // wcdb_status wcdb_uninstall_sns_block_delete_trigger(wcdb_handle handle, char** out_error)
-      try {
-        this.wcdbUninstallSnsBlockDeleteTrigger = this.lib.func('int32 wcdb_uninstall_sns_block_delete_trigger(int64 handle, _Out_ void** outError)')
-      } catch {
-        this.wcdbUninstallSnsBlockDeleteTrigger = null
-      }
-
-      // wcdb_status wcdb_check_sns_block_delete_trigger(wcdb_handle handle, int32_t* out_installed)
-      try {
-        this.wcdbCheckSnsBlockDeleteTrigger = this.lib.func('int32 wcdb_check_sns_block_delete_trigger(int64 handle, _Out_ int32* outInstalled)')
-      } catch {
-        this.wcdbCheckSnsBlockDeleteTrigger = null
-      }
-
-      // wcdb_status wcdb_delete_sns_post(wcdb_handle handle, const char* post_id, char** out_error)
-      try {
-        this.wcdbDeleteSnsPost = this.lib.func('int32 wcdb_delete_sns_post(int64 handle, const char* postId, _Out_ void** outError)')
-      } catch {
-        this.wcdbDeleteSnsPost = null
-      }
-
-      // Named pipe IPC for monitoring (replaces callback)
-      try {
-        this.wcdbStartMonitorPipe = this.lib.func('int32 wcdb_start_monitor_pipe()')
-        this.wcdbStopMonitorPipe = this.lib.func('void wcdb_stop_monitor_pipe()')
-        this.wcdbGetMonitorPipeName = this.lib.func('int32 wcdb_get_monitor_pipe_name(_Out_ void** outName)')
-        this.writeLog('Monitor pipe functions loaded')
-      } catch (e) {
-        console.warn('Failed to load monitor pipe functions:', e)
-        this.wcdbStartMonitorPipe = null
-        this.wcdbStopMonitorPipe = null
-        this.wcdbGetMonitorPipeName = null
-      }
-
-      // void VerifyUser(int64_t hwnd_ptr, const char* message, char* out_result, int max_len)
-      try {
-        this.wcdbVerifyUser = this.lib.func('void VerifyUser(int64 hwnd, const char* message, _Out_ char* outResult, int maxLen)')
-      } catch {
-        this.wcdbVerifyUser = null
-      }
-
-      // wcdb_status wcdb_cloud_init(int32_t interval_seconds)
-      try {
-        this.wcdbCloudInit = this.lib.func('int32 wcdb_cloud_init(int32 intervalSeconds)')
-      } catch {
-        this.wcdbCloudInit = null
-      }
-
-      // wcdb_status wcdb_cloud_report(const char* stats_json)
-      try {
-        this.wcdbCloudReport = this.lib.func('int32 wcdb_cloud_report(const char* statsJson)')
-      } catch {
-        this.wcdbCloudReport = null
-      }
-
-      // void wcdb_cloud_stop()
-      try {
-        this.wcdbCloudStop = this.lib.func('void wcdb_cloud_stop()')
-      } catch {
-        this.wcdbCloudStop = null
-      }
-
-
-      // 初始化
-      const initResult = this.wcdbInit()
-      this.writeLog(`[bootstrap] wcdb_init() => ${initResult}`, true)
-      if (initResult !== 0) {
-        const initLogs = this.readNativeLogs()
-        if (initLogs.length > 0) {
-          this.writeLog(`[bootstrap] wcdb_init logs=${JSON.stringify(initLogs)}`, true)
-        }
-        lastDllInitError = this.describeDllInitFailure(initResult, initLogs)
-        if (isDllFallbackUsableMessage(lastDllInitError)) {
-          console.warn(`WCDB DLL 初始化返回 ${initResult}，DLL 已过期，已切换到自有 fallback`)
-          this.writeLog(`[bootstrap] DLL init returned ${initResult}; dll expired, fallback remains usable`, true)
-        } else {
-          console.warn(`WCDB DLL 初始化返回 ${initResult}，已切换到 fallback 模式`)
-          this.writeLog('DLL 初始化返回非 0，切换到 fallback 模式', true)
-        }
-        this.fallbackMode = true
-        this.initialized = true
-        return true
-      }
-
+    if (!this.dllCompatEnabled) {
+      this.clearDllCompatState()
+      lastDllInitError = null
+      this.writeLog('[bootstrap] initialize: WCDB DLL compat disabled; using native database path', true)
+      this.runtimeMode = 'native'
+      this.fallbackMode = true
       this.initialized = true
+      return true
+    }
+
+    const compat = initializeWcdbDllCompat({
+      resourcesPath: this.resourcesPath,
+      writeLog: (message, force) => this.writeLog(message, force)
+    })
+
+    if (compat.kind === 'ready') {
+      this.clearDllCompatState()
+      this.dllCompatBindings = compat.bindings
+      Object.assign(this, compat.bindings)
+      this.initialized = true
+      this.runtimeMode = 'dll'
       lastDllInitError = null
       return true
-    } catch (e) {
-      const errorMsg = e instanceof Error ? e.message : String(e)
+    }
+
+    if (compat.kind === 'missing') {
+      lastDllInitError = compat.error
+      console.warn('WCDB DLL 不存在，已切换到自有 fallback:', compat.dllPath)
+      this.writeLog(`[bootstrap] initialize: dll not found path=${compat.dllPath}; fallback remains usable`, true)
+    } else if (compat.kind === 'init_failed') {
+      lastDllInitError = compat.error
+      if (isDllFallbackUsableMessage(lastDllInitError)) {
+        console.warn(`WCDB DLL 初始化返回 ${compat.initResult}，DLL 已过期，已切换到自有 fallback`)
+        this.writeLog(`[bootstrap] DLL init returned ${compat.initResult}; dll expired, fallback remains usable`, true)
+      } else {
+        console.warn(`WCDB DLL 初始化返回 ${compat.initResult}，已切换到 fallback 模式`)
+        this.writeLog('DLL 初始化返回非 0，切换到 fallback 模式', true)
+      }
+    } else {
+      const errorMsg = compat.error
       console.error('WCDB 初始化异常:', errorMsg)
       this.writeLog(`WCDB 初始化异常: ${errorMsg}`, true)
       lastDllInitError = errorMsg
-      // 检查是否是常见的 VC++ 运行时缺失错误
       if (errorMsg.includes('126') || errorMsg.includes('找不到指定的模块') ||
         errorMsg.includes('The specified module could not be found')) {
         lastDllInitError = '可能缺少 Visual C++ 运行时库。请安装 Microsoft Visual C++ Redistributable (x64)。'
       } else if (errorMsg.includes('193') || errorMsg.includes('不是有效的 Win32 应用程序')) {
         lastDllInitError = 'DLL 架构不匹配。请确保使用 64 位版本的应用程序。'
       }
-
-      // DLL 失败时激活自有 fallback 模式
       this.writeLog('DLL 初始化失败，切换到自有 fallback 模式', true)
-      this.fallbackMode = true
-      this.initialized = true   // 标记为"已初始化（fallback 模式）"
-      return true
     }
+
+    this.clearDllCompatState()
+    this.runtimeMode = 'native'
+    this.fallbackMode = true
+    this.initialized = true
+    return true
   }
 
   /**
@@ -1138,7 +710,7 @@ export class WcdbCore {
    */
   private async printLogs(force = false): Promise<void> {
     try {
-      const logs = this.readNativeLogs()
+      const logs = readWcdbDllCompatLogs(this.dllCompatBindings)
       if (logs.length > 0) {
         this.writeLog(`wcdb_logs: ${JSON.stringify(logs)}`, force)
       }
@@ -2034,6 +1606,8 @@ export class WcdbCore {
       this.currentDbStoragePath = null
       this.initialized = false
       this.fallbackMode = false
+      this.runtimeMode = 'native'
+      this.clearDllCompatState()
       this.currentWcdbKeys = null
       this.stopLogPolling()
     }
