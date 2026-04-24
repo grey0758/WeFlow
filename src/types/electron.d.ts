@@ -120,6 +120,14 @@ export interface ElectronAPI {
       count?: number
       error?: string
     }>
+    getDbKeyViaDllCompat: (timeoutMs?: number) => Promise<{
+      success: boolean
+      key?: string
+      wcdbKeys?: Record<string, string>
+      error?: string
+      logs?: string[]
+      source?: 'dll'
+    }>
   }
   dbPath: {
     autoDetect: () => Promise<{ success: boolean; path?: string; error?: string }>

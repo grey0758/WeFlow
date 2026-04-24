@@ -80,7 +80,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     clearExportCardLogs: () =>
       ipcRenderer.invoke('diagnostics:clearExportCardLogs'),
     exportExportCardLogs: (payload: { filePath: string; frontendLogs?: unknown[] }) =>
-      ipcRenderer.invoke('diagnostics:exportExportCardLogs', payload)
+      ipcRenderer.invoke('diagnostics:exportExportCardLogs', payload),
+    getDbKeyViaDllCompat: (timeoutMs?: number) =>
+      ipcRenderer.invoke('diagnostics:getDbKeyViaDllCompat', timeoutMs)
   },
 
   // 窗口控制

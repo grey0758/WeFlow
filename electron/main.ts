@@ -1150,6 +1150,27 @@ function registerIpcHandlers() {
     return exportCardDiagnosticsService.exportCombinedLogs(filePath, payload?.frontendLogs || [])
   })
 
+  ipcMain.handle('diagnostics:getDbKeyViaDllCompat', async (event, timeoutMs?: number) => {
+    if (process.platform !== 'win32') {
+      return { success: false, error: 'Only supported on Windows' }
+    }
+
+    const { KeyServiceDllCompat } = await import('./services/keyServiceDllCompat')
+    const keyServiceAny = keyService as any
+    const dllCompat = new KeyServiceDllCompat({
+      ensureKernel32: () => keyServiceAny.ensureKernel32(),
+      findWeChatPid: () => keyServiceAny.findWeChatPid(),
+      detectWeChatLoginRequired: (pid: number) => keyServiceAny.detectWeChatLoginRequired(pid),
+      waitForWeChatWindowComponents: (pid: number, waitTimeoutMs?: number) =>
+        keyServiceAny.waitForWeChatWindowComponents(pid, waitTimeoutMs),
+      normalizeWcdbKeys: (value: unknown) => keyServiceAny.normalizeWcdbKeys(value)
+    })
+
+    return dllCompat.getDbKey(timeoutMs ?? 60_000, (message, level) => {
+      event.sender.send('key:dbKeyStatus', { message, level })
+    })
+  })
+
   // 数据收集服务
   ipcMain.handle('cloud:init', async () => {
     await cloudControlService.init()

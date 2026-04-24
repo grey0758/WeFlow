@@ -5,7 +5,6 @@ import { promisify } from 'util'
 import crypto from 'crypto'
 import { pyWxDumpService } from './pyWxDumpService'
 import { dbPathService } from './dbPathService'
-import { KeyServiceDllCompat } from './keyServiceDllCompat'
 
 const execFileAsync = promisify(execFile)
 
@@ -15,7 +14,7 @@ type DbKeyResult = {
   wcdbKeys?: Record<string, string>
   error?: string
   logs?: string[]
-  source?: 'pywxdump' | 'native' | 'dll'
+  source?: 'pywxdump' | 'native'
 }
 type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string }
 type DbVerificationTarget = { name: string; path: string; saltHex: string; markers: string[] }
@@ -23,13 +22,6 @@ type DbVerificationTarget = { name: string; path: string; saltHex: string; marke
 export class KeyService {
   private readonly isMac = process.platform === 'darwin'
   private koffi: any = null
-  private readonly dllCompat = new KeyServiceDllCompat({
-    ensureKernel32: () => this.ensureKernel32(),
-    findWeChatPid: () => this.findWeChatPid(),
-    detectWeChatLoginRequired: (pid) => this.detectWeChatLoginRequired(pid),
-    waitForWeChatWindowComponents: (pid, timeoutMs) => this.waitForWeChatWindowComponents(pid, timeoutMs),
-    normalizeWcdbKeys: (value) => this.normalizeWcdbKeys(value)
-  })
 
   // Win32 APIs
   private kernel32: any = null
@@ -2125,7 +2117,7 @@ export class KeyService {
       }
       return {
         success: false,
-        error: `自有内存扫描仅覆盖 ${Object.keys(matchedKeys).length}/${targets.length} 个数据库样本，暂时无法完全替代 DLL`,
+        error: `自有内存扫描仅覆盖 ${Object.keys(matchedKeys).length}/${targets.length} 个数据库样本，暂时无法完整覆盖全部样本`,
         logs: targets
           .filter((target) => matchedKeys[target.saltHex])
           .map((target) => `已命中 ${target.name}`)
@@ -2178,13 +2170,6 @@ export class KeyService {
     return mergedKeys
   }
 
-  private async getDbKeyViaDllCompat(
-    timeoutMs: number,
-    onStatus?: (message: string, level: number) => void
-  ): Promise<DbKeyResult> {
-    return this.dllCompat.getDbKey(timeoutMs, onStatus)
-  }
-
   private async _autoGetDbKeyChain(
     timeoutMs = 60_000,
     onStatus?: (message: string, level: number) => void
@@ -2203,7 +2188,7 @@ export class KeyService {
       }
       onStatus?.(normalized, level)
     }
-    emitStatus('Pure-native key strategy: PyWxDump bridge first, native memory scan second, no DLL fallback', 0)
+    emitStatus('Pure-native key strategy: PyWxDump bridge first, native memory scan second', 0)
     emitStatus('Trying PyWxDump bridge first...', 0)
     const pyResult = await this._getDbKeyViaPyWxDump(emitStatus)
     if (pyResult.success) {
