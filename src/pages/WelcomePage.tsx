@@ -433,6 +433,14 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
     handleAutoGetDbKey()
   }
 
+  const imageKeyFallbackHint = '当前账号仍缺少图片 AES 密钥，V4 图片暂时无法解密。请先尝试“缓存计算（支持 kvcomm / MMKV）”；若仍失败，请在微信中打开 2-3 张图片大图后再用“内存扫描”。'
+  const formatImageKeySourceLabel = (source?: 'kvcomm' | 'mmkv' | 'memory') => {
+    if (source === 'kvcomm') return 'kvcomm 缓存'
+    if (source === 'mmkv') return 'MMKV 缓存'
+    if (source === 'memory') return '内存扫描'
+    return '本地缓存'
+  }
+
   const handleAutoGetImageKey = async () => {
     if (isFetchingImageKey) return
     if (!dbPath) { setError('请先选择数据库目录'); return }
@@ -444,14 +452,22 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
       const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath
       const result = await window.electronAPI.key.autoGetImageKey(accountPath, wxid)
       if (result.success && result.aesKey) {
-        if (typeof result.xorKey === 'number') setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        if (typeof result.xorKey === 'number') {
+          setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        }
         setImageAesKey(result.aesKey)
-        setImageKeyStatus('已获取图片密钥')
+        const sourceLabel = formatImageKeySourceLabel(result.source)
+        const verificationLabel = result.verified === false ? '（未校验）' : ''
+        setImageKeyStatus(`已获取图片密钥（${sourceLabel}${verificationLabel}）`)
       } else {
-        setError(result.error || '自动获取图片密钥失败')
+        const failureMessage = result.error || imageKeyFallbackHint
+        setImageKeyStatus(failureMessage)
+        setError(failureMessage)
       }
     } catch (e) {
-      setError(`自动获取图片密钥失败: ${e}`)
+      const failureMessage = `自动获取图片密钥失败: ${e}`
+      setImageKeyStatus(failureMessage)
+      setError(failureMessage)
     } finally {
       setIsFetchingImageKey(false)
     }
@@ -468,14 +484,20 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
       const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath
       const result = await window.electronAPI.key.scanImageKeyFromMemory(accountPath)
       if (result.success && result.aesKey) {
-        if (typeof result.xorKey === 'number') setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        if (typeof result.xorKey === 'number') {
+          setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        }
         setImageAesKey(result.aesKey)
         setImageKeyStatus('内存扫描成功，已获取图片密钥')
       } else {
-        setError(result.error || '内存扫描获取图片密钥失败')
+        const failureMessage = result.error || imageKeyFallbackHint
+        setImageKeyStatus(failureMessage)
+        setError(failureMessage)
       }
     } catch (e) {
-      setError(`内存扫描失败: ${e}`)
+      const failureMessage = `内存扫描失败: ${e}`
+      setImageKeyStatus(failureMessage)
+      setError(failureMessage)
     } finally {
       setIsFetchingImageKey(false)
     }
@@ -935,7 +957,7 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
                   imageKeyStatus && <div className="status-message" style={{ marginTop: '12px' }}>{imageKeyStatus}</div>
                 )}
 
-                <div className="field-hint" style={{ marginTop: '8px' }}>优先推荐缓存计算方案。若图片无法解密，可使用内存扫描（需微信运行并打开 2-3 张图片大图）</div>
+                <div className="field-hint" style={{ marginTop: '8px' }}>优先尝试缓存计算，当前已同时支持旧 kvcomm 与新版 MMKV 目录。若仍提示缺少图片 AES 密钥，请在微信中打开 2-3 张图片大图后再用内存扫描。</div>
               </div>
             )}
           </div>

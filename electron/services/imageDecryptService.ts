@@ -1437,7 +1437,7 @@ export class ImageDecryptService {
     }
     // version === 2
     if (!aesKey || aesKey.length !== 16) {
-      throw new Error('请到设置配置图片解密密钥')
+      throw new Error('当前账号缺少图片 AES 密钥，V4 图片暂时无法解密。请到设置页先点“缓存计算（支持 kvcomm / MMKV）”；若仍失败，请在微信中打开 2-3 张图片大图后再用“内存扫描”。')
     }
     return this.decryptDatV4(datPath, xorKey, aesKey)
   }

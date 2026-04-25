@@ -150,8 +150,8 @@ export interface ElectronAPI {
   }
   key: {
     autoGetDbKey: () => Promise<{ success: boolean; key?: string; wcdbKeys?: Record<string, string>; error?: string; logs?: string[]; source?: 'pywxdump' | 'native' | 'dll' }>
-    autoGetImageKey: (manualDir?: string, wxid?: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; error?: string }>
-    scanImageKeyFromMemory: (userDir: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; error?: string }>
+    autoGetImageKey: (manualDir?: string, wxid?: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string; source?: 'kvcomm' | 'mmkv' | 'memory' }>
+    scanImageKeyFromMemory: (userDir: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string; source?: 'kvcomm' | 'mmkv' | 'memory' }>
     onDbKeyStatus: (callback: (payload: { message: string; level: number }) => void) => () => void
     onImageKeyStatus: (callback: (payload: { message: string }) => void) => () => void
   }

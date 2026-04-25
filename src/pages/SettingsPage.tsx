@@ -887,62 +887,96 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     }
   }
 
+  const imageKeyFallbackHint = '当前账号仍缺少图片 AES 密钥，V4 图片暂时无法解密。请先尝试“缓存计算（支持 kvcomm / MMKV）”；若仍失败，请在微信中打开 2-3 张图片大图后再用“内存扫描”。'
+  const formatImageKeySourceLabel = (source?: 'kvcomm' | 'mmkv' | 'memory') => {
+    if (source === 'kvcomm') return 'kvcomm 缓存'
+    if (source === 'mmkv') return 'MMKV 缓存'
+    if (source === 'memory') return '内存扫描'
+    return '本地缓存'
+  }
+
   const handleAutoGetImageKey = async () => {
-    if (isFetchingImageKey) return;
-    if (!dbPath) { showMessage('请先选择数据库目录', false); return; }
-    setIsFetchingImageKey(true);
+    if (isFetchingImageKey) return
+    if (!dbPath) {
+      showMessage('请先选择数据库目录', false)
+      return
+    }
+    setIsFetchingImageKey(true)
     setImageKeyPercent(0)
-    setImageKeyStatus('正在初始化...');
-    setImageKeyProgress(0);
+    setImageKeyStatus('正在初始化...')
+    setImageKeyProgress(0)
 
     try {
-      const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath;
+      const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath
       const result = await window.electronAPI.key.autoGetImageKey(accountPath, wxid)
       if (result.success && result.aesKey) {
-        if (typeof result.xorKey === 'number') setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        if (typeof result.xorKey === 'number') {
+          setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        }
         setImageAesKey(result.aesKey)
-        setImageKeyStatus('已获取图片密钥')
-        showMessage('已自动获取图片密钥', true)
+        const sourceLabel = formatImageKeySourceLabel(result.source)
+        const verificationLabel = result.verified === false ? '（未校验）' : ''
+        const successMessage = `已获取图片密钥（${sourceLabel}${verificationLabel}）`
+        setImageKeyStatus(successMessage)
+        showMessage(successMessage, true)
         const newXorKey = typeof result.xorKey === 'number' ? result.xorKey : 0
         const newAesKey = result.aesKey
         await configService.setImageXorKey(newXorKey)
         await configService.setImageAesKey(newAesKey)
-        if (wxid) await configService.setWxidConfig(wxid, { decryptKey, imageXorKey: newXorKey, imageAesKey: newAesKey })
+        if (wxid) {
+          await configService.setWxidConfig(wxid, { decryptKey, imageXorKey: newXorKey, imageAesKey: newAesKey })
+        }
       } else {
-        showMessage(result.error || '自动获取图片密钥失败', false)
+        const failureMessage = result.error || imageKeyFallbackHint
+        setImageKeyStatus(failureMessage)
+        showMessage(failureMessage, false)
       }
     } catch (e: any) {
-      showMessage(`自动获取图片密钥失败: ${e}`, false)
+      const failureMessage = `自动获取图片密钥失败: ${e}`
+      setImageKeyStatus(failureMessage)
+      showMessage(failureMessage, false)
     } finally {
       setIsFetchingImageKey(false)
     }
   }
 
   const handleScanImageKeyFromMemory = async () => {
-    if (isFetchingImageKey) return;
-    if (!dbPath) { showMessage('请先选择数据库目录', false); return; }
-    setIsFetchingImageKey(true);
+    if (isFetchingImageKey) return
+    if (!dbPath) {
+      showMessage('请先选择数据库目录', false)
+      return
+    }
+    setIsFetchingImageKey(true)
     setImageKeyPercent(0)
-    setImageKeyStatus('正在扫描内存...');
+    setImageKeyStatus('正在扫描内存...')
 
     try {
-      const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath;
+      const accountPath = wxid ? `${dbPath}/${wxid}` : dbPath
       const result = await window.electronAPI.key.scanImageKeyFromMemory(accountPath)
       if (result.success && result.aesKey) {
-        if (typeof result.xorKey === 'number') setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        if (typeof result.xorKey === 'number') {
+          setImageXorKey(`0x${result.xorKey.toString(16).toUpperCase().padStart(2, '0')}`)
+        }
         setImageAesKey(result.aesKey)
-        setImageKeyStatus('内存扫描成功，已获取图片密钥')
-        showMessage('内存扫描成功，已获取图片密钥', true)
+        const successMessage = '内存扫描成功，已获取图片密钥'
+        setImageKeyStatus(successMessage)
+        showMessage(successMessage, true)
         const newXorKey = typeof result.xorKey === 'number' ? result.xorKey : 0
         const newAesKey = result.aesKey
         await configService.setImageXorKey(newXorKey)
         await configService.setImageAesKey(newAesKey)
-        if (wxid) await configService.setWxidConfig(wxid, { decryptKey, imageXorKey: newXorKey, imageAesKey: newAesKey })
+        if (wxid) {
+          await configService.setWxidConfig(wxid, { decryptKey, imageXorKey: newXorKey, imageAesKey: newAesKey })
+        }
       } else {
-        showMessage(result.error || '内存扫描获取图片密钥失败', false)
+        const failureMessage = result.error || imageKeyFallbackHint
+        setImageKeyStatus(failureMessage)
+        showMessage(failureMessage, false)
       }
     } catch (e: any) {
-      showMessage(`内存扫描失败: ${e}`, false)
+      const failureMessage = `内存扫描失败: ${e}`
+      setImageKeyStatus(failureMessage)
+      showMessage(failureMessage, false)
     } finally {
       setIsFetchingImageKey(false)
     }
@@ -1590,7 +1624,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         ) : (
           imageKeyStatus && <div className="form-hint status-text" style={{ marginTop: '8px' }}>{imageKeyStatus}</div>
         )}
-        <span className="form-hint">优先推荐缓存计算方案。若图片无法解密，可使用内存扫描（需微信运行并打开 2-3 张图片大图）</span>
+        <span className="form-hint">优先尝试缓存计算，当前已同时支持旧 kvcomm 与新版 MMKV 目录。若仍提示缺少图片 AES 密钥，请在微信中打开 2-3 张图片大图后再用内存扫描。</span>
       </div>
 
       <div className="form-group">

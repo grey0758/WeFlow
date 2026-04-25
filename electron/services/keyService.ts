@@ -1,5 +1,5 @@
 import { join, dirname, basename } from 'path'
-import { existsSync, readdirSync, statSync } from 'fs'
+import { existsSync, readdirSync, statSync, openSync, readSync, closeSync } from 'fs'
 import { execFile, spawn } from 'child_process'
 import { promisify } from 'util'
 import crypto from 'crypto'
@@ -16,7 +16,8 @@ type DbKeyResult = {
   logs?: string[]
   source?: 'pywxdump' | 'native'
 }
-type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string }
+type ImageCodeCandidate = { code: number; source: 'kvcomm' | 'mmkv'; origin: string }
+type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string; source?: 'kvcomm' | 'mmkv' | 'memory' }
 type DbVerificationTarget = { name: string; path: string; saltHex: string; markers: string[] }
 
 export class KeyService {
@@ -2284,8 +2285,23 @@ export class KeyService {
     return candidates
   }
 
-  private collectKvcommCodes(accountPath?: string): number[] {
-    const codeSet = new Set<number>()
+  private pushImageCodeCandidate(
+    candidates: ImageCodeCandidate[],
+    seen: Set<number>,
+    source: 'kvcomm' | 'mmkv',
+    origin: string,
+    rawCode: number
+  ): void {
+    if (!Number.isFinite(rawCode) || rawCode <= 0 || rawCode > 0xFFFFFFFF) return
+    const code = rawCode >>> 0
+    if (seen.has(code)) return
+    seen.add(code)
+    candidates.push({ code, source, origin })
+  }
+
+  private collectKvcommCodeCandidates(accountPath?: string): ImageCodeCandidate[] {
+    const candidates: ImageCodeCandidate[] = []
+    const seen = new Set<number>()
     const pattern = /^key_(\d+)_.+\.statistic$/i
 
     for (const kvcommDir of this.getKvcommCandidates(accountPath)) {
@@ -2295,14 +2311,12 @@ export class KeyService {
         for (const file of files) {
           const match = file.match(pattern)
           if (!match) continue
-          const code = Number(match[1])
-          if (!Number.isFinite(code) || code <= 0 || code > 0xFFFFFFFF) continue
-          codeSet.add(code)
+          this.pushImageCodeCandidate(candidates, seen, 'kvcomm', join(kvcommDir, file), Number(match[1]))
         }
       } catch { }
     }
 
-    return Array.from(codeSet)
+    return candidates
   }
 
   private getKvcommCandidates(accountPath?: string): string[] {
@@ -2336,6 +2350,117 @@ export class KeyService {
     return Array.from(candidates)
   }
 
+  private getMmkvCandidates(accountPath?: string): string[] {
+    const candidates = new Set<string>()
+
+    if (accountPath) {
+      const normalized = accountPath.replace(/[\\/]+$/, '')
+      candidates.add(join(normalized, 'db_storage', 'MMKV'))
+      candidates.add(join(normalized, 'business', 'xweb', 'mmkv'))
+
+      let cursor = normalized
+      for (let i = 0; i < 4; i++) {
+        candidates.add(join(cursor, 'db_storage', 'MMKV'))
+        candidates.add(join(cursor, 'business', 'xweb', 'mmkv'))
+        const next = dirname(cursor)
+        if (next === cursor) break
+        cursor = next
+      }
+    }
+
+    try {
+      const defaultRoot = dbPathService.getDefaultPath().replace(/[\\/]+$/, '')
+      candidates.add(join(defaultRoot, 'db_storage', 'MMKV'))
+      candidates.add(join(defaultRoot, 'business', 'xweb', 'mmkv'))
+      candidates.add(join(dirname(defaultRoot), 'db_storage', 'MMKV'))
+      candidates.add(join(dirname(defaultRoot), 'business', 'xweb', 'mmkv'))
+    } catch { }
+
+    return Array.from(candidates)
+  }
+
+  private readImageCandidateSample(filePath: string, maxBytes: number = 256 * 1024): Buffer | null {
+    let fd: number | null = null
+    try {
+      const stat = statSync(filePath)
+      const size = Math.min(stat.size, maxBytes)
+      if (size <= 0) return null
+      fd = openSync(filePath, 'r')
+      const buffer = Buffer.alloc(size)
+      const bytesRead = readSync(fd, buffer, 0, size, 0)
+      return bytesRead > 0 ? buffer.subarray(0, bytesRead) : null
+    } catch {
+      return null
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd) } catch { }
+      }
+    }
+  }
+
+  private extractImageCodesFromBuffer(buffer: Buffer, xorKeyHint?: number | null): number[] {
+    const codes = new Set<number>()
+    const addCode = (rawCode: number) => {
+      if (!Number.isFinite(rawCode) || rawCode <= 0 || rawCode > 0xFFFFFFFF) return
+      const code = rawCode >>> 0
+      if (xorKeyHint !== null && xorKeyHint !== undefined && (code & 0xFF) !== xorKeyHint) return
+      codes.add(code)
+    }
+
+    const asciiText = buffer.toString('latin1')
+    for (const token of asciiText.match(/\d{5,10}/g) ?? []) {
+      addCode(Number(token))
+      if (codes.size >= 256) break
+    }
+
+    const step = xorKeyHint === null || xorKeyHint === undefined ? 4 : 1
+    const maxOffset = Math.min(Math.max(buffer.length - 4, 0), 64 * 1024)
+    for (let offset = 0; offset <= maxOffset && codes.size < 2048; offset += step) {
+      const le = buffer.readUInt32LE(offset)
+      addCode(le)
+      const be = buffer.readUInt32BE(offset)
+      if (be !== le) addCode(be)
+    }
+
+    return Array.from(codes)
+  }
+
+  private collectMmkvCodeCandidates(accountPath?: string, xorKeyHint?: number | null): ImageCodeCandidate[] {
+    const candidates: ImageCodeCandidate[] = []
+    const seen = new Set<number>()
+    const explicitNamePatterns = [
+      /^f(\d+)tinfo\.mmkv(?:\.crc)?$/i,
+      /^key[_-]?(\d+)(?:[._-].+)?$/i
+    ]
+
+    for (const mmkvDir of this.getMmkvCandidates(accountPath)) {
+      if (!existsSync(mmkvDir)) continue
+      try {
+        const entries = readdirSync(mmkvDir, { withFileTypes: true })
+        for (const entry of entries) {
+          if (!entry.isFile()) continue
+          const filePath = join(mmkvDir, entry.name)
+          for (const pattern of explicitNamePatterns) {
+            const match = entry.name.match(pattern)
+            if (!match) continue
+            this.pushImageCodeCandidate(candidates, seen, 'mmkv', filePath, Number(match[1]))
+          }
+          for (const token of entry.name.match(/\d{5,10}/g) ?? []) {
+            this.pushImageCodeCandidate(candidates, seen, 'mmkv', filePath, Number(token))
+          }
+          if (entry.name.endsWith('.crc')) continue
+          const sample = this.readImageCandidateSample(filePath)
+          if (!sample) continue
+          for (const code of this.extractImageCodesFromBuffer(sample, xorKeyHint)) {
+            this.pushImageCodeCandidate(candidates, seen, 'mmkv', filePath, code)
+          }
+        }
+      } catch { }
+    }
+
+    return candidates
+  }
+
   async autoGetImageKeyPure(
       manualDir?: string,
       onProgress?: (message: string) => void,
@@ -2343,42 +2468,73 @@ export class KeyService {
   ): Promise<ImageKeyResult> {
     if (!this.ensureWin32()) return { success: false, error: 'Windows only' }
 
-    onProgress?.('Deriving image key from kvcomm and template data...')
-
-    const codes = this.collectKvcommCodes(manualDir)
-    if (codes.length === 0) {
-      return { success: false, error: 'No kvcomm image-key codes found' }
-    }
-
-    console.log('[ImageKey] kvcomm codes:', codes)
-
     const wxidCandidates = await this.collectWxidCandidates(manualDir, wxidParam)
     let verifyCiphertext: Buffer | null = null
+    let templateXorKey: number | null = null
     if (manualDir && existsSync(manualDir)) {
       const template = await this._findTemplateData(manualDir, 32)
       verifyCiphertext = template.ciphertext
+      templateXorKey = template.xorKey
+    }
+
+    onProgress?.('正在从 kvcomm / MMKV 缓存推导图片密钥...')
+
+    const kvcommCandidates = this.collectKvcommCodeCandidates(manualDir)
+    const mmkvCandidates = this.collectMmkvCodeCandidates(manualDir, templateXorKey)
+    const allCandidates = [...kvcommCandidates, ...mmkvCandidates]
+
+    console.log('[ImageKey] candidate summary:', {
+      manualDir,
+      templateXorKey,
+      kvcommCount: kvcommCandidates.length,
+      mmkvCount: mmkvCandidates.length,
+      kvcommOrigins: kvcommCandidates.slice(0, 8).map(item => item.origin),
+      mmkvOrigins: mmkvCandidates.slice(0, 8).map(item => item.origin)
+    })
+
+    onProgress?.(`已发现 ${kvcommCandidates.length} 个 kvcomm 候选、${mmkvCandidates.length} 个 MMKV 候选`)
+
+    if (allCandidates.length === 0) {
+      return {
+        success: false,
+        error: '未在当前账号目录的 kvcomm / MMKV 中找到可用图片取钥信息。请先尝试“缓存计算”；若仍失败，请在微信中打开 2-3 张图片大图后使用“内存扫描”。'
+      }
     }
 
     if (verifyCiphertext) {
-      onProgress?.(`Verifying ${wxidCandidates.length} wxid candidates...`)
+      onProgress?.(`正在校验 ${wxidCandidates.length} 个 wxid 候选与 ${allCandidates.length} 个图片码候选...`)
       for (const candidateWxid of wxidCandidates) {
-        for (const code of codes) {
-          const { xorKey, aesKey } = this.deriveImageKeys(code, candidateWxid)
+        for (const candidate of allCandidates) {
+          const { xorKey, aesKey } = this.deriveImageKeys(candidate.code, candidateWxid)
           if (!this.verifyDerivedAesKey(aesKey, verifyCiphertext)) continue
-          onProgress?.(`Image key resolved (wxid: ${candidateWxid}, code: ${code})`)
-          console.log('[ImageKey] verified:', { wxid: candidateWxid, code })
-          return { success: true, xorKey, aesKey, verified: true }
+          onProgress?.(`图片密钥已解析（来源: ${candidate.source}，wxid: ${candidateWxid}）`)
+          console.log('[ImageKey] verified:', {
+            wxid: candidateWxid,
+            code: candidate.code,
+            source: candidate.source,
+            origin: candidate.origin
+          })
+          return { success: true, xorKey, aesKey, verified: true, source: candidate.source }
         }
       }
-      return { success: false, error: 'kvcomm code did not match current wxid; verify the account directory or use memory scan' }
+      return {
+        success: false,
+        error: '已扫描当前账号目录中的 kvcomm / MMKV 候选，但都无法与当前图片模板匹配。请确认目录属于当前微信账号；若仍失败，请在微信中打开 2-3 张图片大图后使用“内存扫描”。'
+      }
     }
 
+    onProgress?.('未找到可验证图片模板，将返回未校验的缓存推导结果')
     const fallbackWxid = wxidCandidates[0] || 'unknown'
-    const fallbackCode = codes[0]
-    const { xorKey, aesKey } = this.deriveImageKeys(fallbackCode, fallbackWxid)
-    onProgress?.(`Image key resolved (wxid: ${fallbackWxid}, code: ${fallbackCode})`)
-    console.log('[ImageKey] fallback-derived:', { wxid: fallbackWxid, code: fallbackCode })
-    return { success: true, xorKey, aesKey, verified: false }
+    const fallbackCandidate = allCandidates[0]
+    const { xorKey, aesKey } = this.deriveImageKeys(fallbackCandidate.code, fallbackWxid)
+    onProgress?.(`图片密钥已解析（未校验，来源: ${fallbackCandidate.source}）`)
+    console.log('[ImageKey] fallback-derived:', {
+      wxid: fallbackWxid,
+      code: fallbackCandidate.code,
+      source: fallbackCandidate.source,
+      origin: fallbackCandidate.origin
+    })
+    return { success: true, xorKey, aesKey, verified: false, source: fallbackCandidate.source }
   }
 
   async autoGetImageKey(
@@ -2432,7 +2588,7 @@ export class KeyService {
         const aesKey = await this._scanMemoryForAesKey(pid, ciphertext, onProgress)
         if (aesKey) {
           onProgress?.('密钥获取成功')
-          return { success: true, xorKey, aesKey }
+          return { success: true, xorKey, aesKey, source: 'memory' }
         }
         // 等 5 秒再试
         await new Promise(r => setTimeout(r, 5000))
@@ -2516,7 +2672,7 @@ export class KeyService {
     const ReadProcessMemory = this.kernel32.func('ReadProcessMemory', 'bool', ['void*', 'uintptr', 'void*', 'size_t', this.koffi.out('size_t*')])
 
     // RW 保护标志（只扫可写区域，速度更快）
-    const RW_FLAGS = 0x04 | 0x08 | 0x40 | 0x80 // PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    const READABLE_FLAGS = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80 // PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
     const MEM_COMMIT = 0x1000
     const PAGE_NOACCESS = 0x01
     const PAGE_GUARD = 0x100
@@ -2550,7 +2706,7 @@ export class KeyService {
         if (state === MEM_COMMIT &&
             protect !== PAGE_NOACCESS &&
             (protect & PAGE_GUARD) === 0 &&
-            (protect & RW_FLAGS) !== 0 &&
+            (protect & READABLE_FLAGS) !== 0 &&
             size <= 50 * 1024 * 1024) {
           regions.push([base, size])
         }
@@ -2604,22 +2760,25 @@ export class KeyService {
   }
 
   private _searchAsciiKey(data: Buffer, ciphertext: Buffer): string | null {
-    for (let i = 0; i < data.length - 34; i++) {
-      if (this._isAlphaNum(data[i])) continue
+    const seenCandidates = new Set<string>()
+    for (let i = 0; i <= data.length - 32; i++) {
       let valid = true
-      for (let j = 1; j <= 32; j++) {
+      for (let j = 0; j < 32; j++) {
         if (!this._isAlphaNum(data[i + j])) { valid = false; break }
       }
       if (!valid) continue
-      if (i + 33 < data.length && this._isAlphaNum(data[i + 33])) continue
-      const keyBytes = data.subarray(i + 1, i + 33)
-      if (this._verifyAesKey(keyBytes, ciphertext)) return keyBytes.toString('ascii').substring(0, 16)
+      const keyBytes = data.subarray(i, i + 32)
+      const candidate = keyBytes.toString('ascii')
+      if (seenCandidates.has(candidate)) continue
+      seenCandidates.add(candidate)
+      if (this._verifyAesKey(keyBytes, ciphertext)) return candidate.substring(0, 16)
     }
     return null
   }
 
   private _searchUtf16Key(data: Buffer, ciphertext: Buffer): string | null {
-    for (let i = 0; i < data.length - 65; i++) {
+    const seenCandidates = new Set<string>()
+    for (let i = 0; i <= data.length - 64; i++) {
       let valid = true
       for (let j = 0; j < 32; j++) {
         if (data[i + j * 2 + 1] !== 0x00 || !this._isAlphaNum(data[i + j * 2])) { valid = false; break }
@@ -2627,7 +2786,10 @@ export class KeyService {
       if (!valid) continue
       const keyBytes = Buffer.alloc(32)
       for (let j = 0; j < 32; j++) keyBytes[j] = data[i + j * 2]
-      if (this._verifyAesKey(keyBytes, ciphertext)) return keyBytes.toString('ascii').substring(0, 16)
+      const candidate = keyBytes.toString('ascii')
+      if (seenCandidates.has(candidate)) continue
+      seenCandidates.add(candidate)
+      if (this._verifyAesKey(keyBytes, ciphertext)) return candidate.substring(0, 16)
     }
     return null
   }
