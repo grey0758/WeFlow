@@ -176,8 +176,23 @@ async function main() {
   if (!emojiMsg?.emojiMd5) {
     throw new Error('emoji sample md5 not found in emoticon.db')
   }
-  step(`download emoji ${emojiMsg.emojiMd5}`)
-  const emojiLocalPath = await chatService.downloadEmojiFile(emojiMsg)
+  step(`resolve emoji url ${emojiMsg.emojiMd5}`)
+  const emojiUrlResult = await wcdbService.getEmoticonCdnUrl(emoticonDbPath, emojiMsg.emojiMd5)
+  const emojiResolvedUrl = String(emojiUrlResult?.url || '').trim()
+  if (emojiResolvedUrl) {
+    emojiMsg.emojiCdnUrl = emojiResolvedUrl
+  }
+
+  let emojiLocalPath: string | null = null
+  let emojiDownloadSuccess = false
+  if (emojiResolvedUrl) {
+    step(`download emoji ${emojiMsg.emojiMd5}`)
+    const emojiDownloadResult = await chatService.downloadEmoji(emojiResolvedUrl, emojiMsg.emojiMd5)
+    emojiLocalPath = emojiDownloadResult.success && emojiDownloadResult.localPath
+      ? emojiDownloadResult.localPath
+      : null
+    emojiDownloadSuccess = Boolean(emojiLocalPath && fs.existsSync(emojiLocalPath))
+  }
 
   const videoBaseDir = path.join(accountDir, 'msg', 'video')
   const localMp4Count = countFilesWithExt(videoBaseDir, '.mp4')
@@ -221,7 +236,7 @@ async function main() {
     success:
       Boolean(avatarUrl) &&
       avatarUrl.startsWith('data:image/') &&
-      Boolean(emojiLocalPath && fs.existsSync(emojiLocalPath)) &&
+      Boolean(emojiResolvedUrl) &&
       (videoSkippedReason !== null || Boolean(videoInfo?.exists && videoInfo.videoUrl && fs.existsSync(videoInfo.videoUrl))),
     durationMs: Date.now() - startedAt,
     runRoot,
@@ -239,7 +254,10 @@ async function main() {
     emoji: {
       table: emoticonTable || null,
       md5: emojiMsg.emojiMd5,
+      resolveSuccess: Boolean(emojiResolvedUrl),
+      resolvedUrlPreview: emojiResolvedUrl ? emojiResolvedUrl.slice(0, 96) : null,
       cdnUrlPresent: Boolean(String(emojiMsg.emojiCdnUrl || '').trim()),
+      downloadSuccess: emojiDownloadSuccess,
       localPath: emojiLocalPath || null,
       localExists: Boolean(emojiLocalPath && fs.existsSync(emojiLocalPath))
     },
