@@ -812,10 +812,20 @@ class ChatService {
             base64Data = row.image_buffer.toString('base64')
           } else if (Array.isArray(row.image_buffer)) {
             base64Data = Buffer.from(row.image_buffer).toString('base64')
+          } else if (row.image_buffer && typeof row.image_buffer === 'object') {
+            const bytes = Object.values(row.image_buffer)
+              .filter((value): value is number => Number.isFinite(value as number))
+              .map((value) => Number(value) & 0xff)
+            if (bytes.length > 0) {
+              base64Data = Buffer.from(bytes).toString('base64')
+            }
           }
 
           if (base64Data) {
-            result[username] = `data:image/jpeg;base64,${base64Data}`
+            const mime = typeof row.image_buffer === 'string' && row.image_buffer.toLowerCase().startsWith('89504e47')
+              ? 'image/png'
+              : 'image/jpeg'
+            result[username] = `data:${mime};base64,${base64Data}`
           }
         }
       }

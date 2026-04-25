@@ -19,6 +19,7 @@
     "electron:dev": "vite --mode electron",
     "electron:build": "npm run build",
     "verify:functional-smoke": "electron scripts/run-electron-ts.js scripts/verify-functional-smoke.ts",
+    "verify:media-service-smoke": "electron scripts/run-electron-ts.js scripts/verify-media-service-smoke.ts",
     "verify:key-strategy": "electron scripts/run-electron-ts.js scripts/verify-db-key-strategy.ts"
   },
   "dependencies": {
