@@ -1717,11 +1717,20 @@ export class KeyService {
       const targetRelativePaths = [
         ['session.db', join('session', 'session.db')],
         ['contact.db', join('contact', 'contact.db')],
+        ['contact_fts.db', join('contact', 'contact_fts.db')],
+        ['head_image.db', join('head_image', 'head_image.db')],
         ['message_0.db', join('message', 'message_0.db')],
         ['biz_message_0.db', join('message', 'biz_message_0.db')],
         ['message_fts.db', join('message', 'message_fts.db')],
         ['message_resource.db', join('message', 'message_resource.db')],
-        ['sns.db', join('sns', 'sns.db')]
+        ['sns.db', join('sns', 'sns.db')],
+        ['hardlink.db', join('hardlink', 'hardlink.db')],
+        ['emoticon.db', join('emoticon', 'emoticon.db')],
+        ['favorite.db', join('favorite', 'favorite.db')],
+        ['favorite_fts.db', join('favorite', 'favorite_fts.db')],
+        ['bizchat.db', join('bizchat', 'bizchat.db')],
+        ['general.db', join('general', 'general.db')],
+        ['solitaire.db', join('solitaire', 'solitaire.db')]
       ] as const
 
       const { readFileSync } = require('fs') as typeof import('fs')

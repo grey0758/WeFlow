@@ -54,6 +54,18 @@ function listFiles(baseDir: string, limit = 12): string[] {
   return result
 }
 
+function pickFirstValue(rows: any[] | undefined, keys: string[]): string {
+  if (!Array.isArray(rows) || rows.length === 0) return ''
+  const row = rows[0] || {}
+  for (const key of keys) {
+    const value = row?.[key]
+    if (value !== undefined && value !== null && String(value).trim()) {
+      return String(value).trim()
+    }
+  }
+  return ''
+}
+
 async function main() {
   await app.whenReady()
 
@@ -125,6 +137,66 @@ async function main() {
   step('sns getTimeline')
   const timelineResult = await snsService.getTimeline(5, 0)
 
+  const accountDir = path.join(detected.path, wxid)
+  const hardlinkDbPath = path.join(accountDir, 'db_storage', 'hardlink', 'hardlink.db')
+  const headImageDbPath = path.join(accountDir, 'db_storage', 'head_image', 'head_image.db')
+  const emoticonDbPath = path.join(accountDir, 'db_storage', 'emoticon', 'emoticon.db')
+
+  step('hardlink db query')
+  const hardlinkTableResult = await wcdbService.execQuery(
+    'media',
+    hardlinkDbPath,
+    "SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'image_hardlink_info%' OR name='video_hardlink_info_v4') ORDER BY name"
+  )
+  const imageHardlinkTable = pickFirstValue(
+    hardlinkTableResult.rows?.filter((row: any) => String(row?.name || '').startsWith('image_hardlink_info')),
+    ['name']
+  )
+  const hardlinkImageSample = imageHardlinkTable
+    ? await wcdbService.execQuery(
+      'media',
+      hardlinkDbPath,
+      `SELECT md5, file_name, dir1, dir2 FROM ${imageHardlinkTable} LIMIT 1`
+    )
+    : { success: false, error: 'image hardlink table missing' }
+  const hardlinkVideoSample = await wcdbService.execQuery(
+    'media',
+    hardlinkDbPath,
+    "SELECT md5, file_name FROM video_hardlink_info_v4 LIMIT 1"
+  )
+
+  step('head_image db query')
+  const headImageSample = await wcdbService.execQuery(
+    'media',
+    headImageDbPath,
+    "SELECT username, length(image_buffer) AS image_size FROM head_image LIMIT 1"
+  )
+
+  step('emoticon db query')
+  const emoticonTableResult = await wcdbService.execQuery(
+    'media',
+    emoticonDbPath,
+    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('EmojiInfo', 'kNonStoreEmoticonTable') ORDER BY name"
+  )
+  const emoticonTable = pickFirstValue(emoticonTableResult.rows, ['name'])
+  const emoticonSample = emoticonTable === 'kNonStoreEmoticonTable'
+    ? await wcdbService.execQuery(
+      'media',
+      emoticonDbPath,
+      "SELECT md5, cdn_url, extern_url, thumb_url FROM kNonStoreEmoticonTable LIMIT 1"
+    )
+    : emoticonTable === 'EmojiInfo'
+      ? await wcdbService.execQuery(
+        'media',
+        emoticonDbPath,
+        "SELECT md5, cdnUrl, CdnUrl FROM EmojiInfo LIMIT 1"
+      )
+      : { success: false, error: 'no supported emoticon table found' }
+  const emoticonMd5 = pickFirstValue(emoticonSample.rows, ['md5', 'Md5'])
+  const emoticonLookup = emoticonMd5
+    ? await wcdbService.getEmoticonCdnUrl(emoticonDbPath, emoticonMd5)
+    : { success: false, error: 'no emoticon sample found' }
+
   step(`export getExportStats ${firstSessionId || '(skip)'}`)
   const exportStatsResult = firstSessionId
     ? await exportService.getExportStats([firstSessionId], {
@@ -179,6 +251,9 @@ async function main() {
       Boolean(messagesResult?.success) &&
       Boolean(snsStatsResult?.success) &&
       Boolean(timelineResult?.success) &&
+      Boolean(hardlinkTableResult?.success) &&
+      Boolean(headImageSample?.success) &&
+      Boolean(emoticonSample?.success) &&
       Boolean(contactExportResult?.success) &&
       Boolean(sessionExportResult?.success) &&
       Boolean(snsExportResult?.success),
@@ -206,6 +281,25 @@ async function main() {
     timeline: {
       success: Boolean(timelineResult?.success),
       count: Array.isArray(timelineResult?.timeline) ? timelineResult.timeline.length : 0
+    },
+    hardlink: {
+      success: Boolean(hardlinkTableResult?.success),
+      tableCount: Array.isArray(hardlinkTableResult?.rows) ? hardlinkTableResult.rows.length : 0,
+      imageTable: imageHardlinkTable || null,
+      imageSample: hardlinkImageSample,
+      videoSample: hardlinkVideoSample
+    },
+    headImage: {
+      success: Boolean(headImageSample?.success),
+      sampleCount: Array.isArray(headImageSample?.rows) ? headImageSample.rows.length : 0,
+      sample: headImageSample
+    },
+    emoticon: {
+      success: Boolean(emoticonSample?.success),
+      table: emoticonTable || null,
+      sampleCount: Array.isArray(emoticonSample?.rows) ? emoticonSample.rows.length : 0,
+      sample: emoticonSample,
+      lookup: emoticonLookup
     },
     exportStats: exportStatsResult,
     contactExport: {

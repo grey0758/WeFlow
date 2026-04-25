@@ -497,6 +497,27 @@ export class WcdbCore {
     return null
   }
 
+  private resolveFallbackAccountDirName(dbPath: string, wxid: string): { accountDir: string; dbStoragePath: string | null } {
+    const dbStoragePath = this.resolveDbStoragePath(dbPath, wxid)
+    if (dbStoragePath) {
+      const accountDir = basename(dirname(dbStoragePath))
+      if (accountDir) {
+        return { accountDir, dbStoragePath }
+      }
+    }
+    return { accountDir: wxid || 'unknown', dbStoragePath }
+  }
+
+  private getFallbackRuntimeNamespace(): string {
+    const seed = String(this.userDataPath || process.cwd() || process.pid).trim()
+    let hash = 2166136261
+    for (let i = 0; i < seed.length; i += 1) {
+      hash ^= seed.charCodeAt(i)
+      hash = Math.imul(hash, 16777619)
+    }
+    return `runtime_${(hash >>> 0).toString(16)}`
+  }
+
   private isRealDbFileName(name: string): boolean {
     const lower = String(name || '').toLowerCase()
     if (!lower.endsWith('.db')) return false
@@ -933,8 +954,13 @@ export class WcdbCore {
       // 关闭旧的 better-sqlite3 连接
       this.closeFallbackDbs()
 
+      const { accountDir: fallbackAccountDir, dbStoragePath } = this.resolveFallbackAccountDirName(dbPath, wxid)
+      if (fallbackAccountDir !== (wxid || 'unknown')) {
+        this.writeLog(`openFallback: normalize wxid ${wxid || 'unknown'} -> ${fallbackAccountDir}`, true)
+      }
+
       // 解密输出目录（先计算，以便提前检测是否已有解密文件）
-      const outDir = pyWxDumpService.makeDecryptedDir(wxid || 'unknown')
+      const outDir = pyWxDumpService.makeDecryptedDir(join(this.getFallbackRuntimeNamespace(), fallbackAccountDir))
 
       // 已有解密文件时跳过原始DB检查和重新解密，直接复用
       const hasExistingDecrypted = (() => {
@@ -953,9 +979,8 @@ export class WcdbCore {
 
       if (hasExistingDecrypted) {
         // Check if source DB files are newer than decrypted files → re-decrypt if stale
-        const dbStoragePath2 = this.resolveDbStoragePath(dbPath, wxid)
         let needRedo = false
-        if (dbStoragePath2 && existsSync(dbStoragePath2)) {
+        if (dbStoragePath && existsSync(dbStoragePath)) {
           try {
             const getNewestMtime = (dir: string): number => {
               let newest = 0
@@ -969,7 +994,7 @@ export class WcdbCore {
               walk(dir)
               return newest
             }
-            const srcMtime = getNewestMtime(dbStoragePath2)
+            const srcMtime = getNewestMtime(dbStoragePath)
             const decMtime = getNewestMtime(outDir)
             if (srcMtime > decMtime) {
               this.writeLog(`openFallback: 源DB已更新(${new Date(srcMtime).toISOString()})，重新解密`, true)
@@ -982,7 +1007,7 @@ export class WcdbCore {
           this.currentPath = dbPath
           this.currentKey = hexKey
           this.currentWxid = wxid
-          this.currentDbStoragePath = null
+          this.currentDbStoragePath = dbStoragePath
           this.fallbackDecryptedDir = outDir
           return true
         }
@@ -990,7 +1015,6 @@ export class WcdbCore {
       }
 
       // 没有解密文件时，需要原始DB目录
-      const dbStoragePath = this.resolveDbStoragePath(dbPath, wxid)
       this.writeLog(`openFallback dbPath=${dbPath} wxid=${wxid} dbStorage=${dbStoragePath || 'null'}`, true)
 
       if (!dbStoragePath || !existsSync(dbStoragePath)) {
@@ -1042,7 +1066,7 @@ export class WcdbCore {
           this.currentPath = dbPath
           this.currentKey = hexKey
           this.currentWxid = wxid
-          this.currentDbStoragePath = null
+          this.currentDbStoragePath = dbStoragePath
           this.fallbackDecryptedDir = outDir
           return true
         }
@@ -1079,9 +1103,10 @@ export class WcdbCore {
 
     // 优先按 pathHint（绝对路径或相对路径）查找
     if (pathHint) {
-      // 如果 pathHint 是存在的绝对路径（如 hardlink.db），直接打开，不加 de_ 前缀
-      if (existsSync(pathHint)) {
-        return this.openFallbackDb(pathHint)
+      // 只直接打开 fallback 明文库，避免把原始加密库误当成 SQLite 复用。
+      if (existsSync(pathHint) && this.isFallbackReadableDbPath(pathHint)) {
+        const directDb = this.openFallbackDb(pathHint)
+        if (directDb) return directDb
       }
       const hintName = pathHint.replace(/\\/g, '/').split('/').pop() || ''
       const deName = hintName.startsWith('de_') ? hintName : `de_${hintName}`
@@ -1129,6 +1154,16 @@ export class WcdbCore {
     return null
   }
 
+  private isFallbackReadableDbPath(filePath: string): boolean {
+    const normalizedPath = String(filePath || '').replace(/\\/g, '/').toLowerCase()
+    if (!normalizedPath) return false
+    const baseName = basename(filePath).toLowerCase()
+    if (baseName.startsWith('de_')) return true
+    if (!this.fallbackDecryptedDir) return false
+    const fallbackRoot = this.fallbackDecryptedDir.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+    return normalizedPath === fallbackRoot || normalizedPath.startsWith(`${fallbackRoot}/`)
+  }
+
   /** 在解密目录中递归查找指定文件名 */
   private findDecryptedFile(name: string): string | null {
     if (!this.fallbackDecryptedDir) return null
@@ -1151,6 +1186,13 @@ export class WcdbCore {
     try {
       const BetterSqlite3 = require('better-sqlite3')
       const db = new BetterSqlite3(filePath, { readonly: true, fileMustExist: true })
+      try {
+        db.prepare('SELECT count(*) AS c FROM sqlite_master LIMIT 1').get()
+      } catch (e) {
+        try { db.close() } catch {}
+        this.writeLog(`openFallbackDb invalid sqlite ${filePath}: ${String(e)}`, true)
+        return null
+      }
       this.fallbackDbs.set(filePath, db)
       return db
     } catch (e) {
@@ -2823,8 +2865,11 @@ export class WcdbCore {
       for (const sql of [
         `SELECT cdnUrl FROM EmojiInfo WHERE md5='${safeMd5}' LIMIT 1`,
         `SELECT CdnUrl FROM EmojiInfo WHERE Md5='${safeMd5}' LIMIT 1`,
+        `SELECT cdn_url AS cdnUrl FROM kNonStoreEmoticonTable WHERE md5='${safeMd5}' LIMIT 1`,
+        `SELECT extern_url AS cdnUrl FROM kNonStoreEmoticonTable WHERE md5='${safeMd5}' LIMIT 1`,
+        `SELECT thumb_url AS cdnUrl FROM kNonStoreEmoticonTable WHERE md5='${safeMd5}' LIMIT 1`,
       ]) {
-        const r = this.execQueryFallback('misc', null, sql)
+        const r = this.execQueryFallback('media', dbPath, sql)
         if (r.success && r.rows?.length) {
           const url = r.rows[0].cdnUrl || r.rows[0].CdnUrl || ''
           if (url) return { success: true, url }
