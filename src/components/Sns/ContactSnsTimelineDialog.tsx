@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { SnsPostItem } from './SnsPostItem'
 import type { SnsPost } from '../../types/sns'
 import {
+  buildTimelineTargetUsernames,
   type ContactSnsRankItem,
   type ContactSnsRankMode,
   type ContactSnsTimelineTarget,
@@ -119,6 +120,10 @@ export function ContactSnsTimelineDialog({
   const rankCacheRef = useRef<Record<string, ContactSnsRankCacheEntry>>({})
 
   const targetUsername = String(target?.username || '').trim()
+  const targetUsernames = useMemo(
+    () => buildTimelineTargetUsernames(targetUsername, ...(target?.candidateUsernames || [])),
+    [target?.candidateUsernames, targetUsername]
+  )
   const targetDisplayName = target?.displayName || targetUsername
   const targetAvatarUrl = target?.avatarUrl
 
@@ -150,7 +155,7 @@ export function ContactSnsTimelineDialog({
       const result = await window.electronAPI.sns.getTimeline(
         TIMELINE_PAGE_SIZE,
         0,
-        [nextTarget.username],
+        buildTimelineTargetUsernames(nextTarget.username, ...(nextTarget.candidateUsernames || [])),
         '',
         undefined,
         endTime
@@ -210,7 +215,9 @@ export function ContactSnsTimelineDialog({
         return
       }
 
-      const rawCount = Number(result.counts[nextTarget.username] || 0)
+      const countCandidates = buildTimelineTargetUsernames(nextTarget.username, ...(nextTarget.candidateUsernames || []))
+      const matchedKey = countCandidates.find((candidate) => Object.prototype.hasOwnProperty.call(result.counts || {}, candidate))
+      const rawCount = Number((matchedKey ? result.counts[matchedKey] : result.counts[nextTarget.username]) || 0)
       const normalized = Number.isFinite(rawCount) ? Math.max(0, Math.floor(rawCount)) : 0
       setTimelineTotalPosts(normalized)
       setRankTotalPosts(normalized)
@@ -259,7 +266,7 @@ export function ContactSnsTimelineDialog({
         const result = await window.electronAPI.sns.getTimeline(
           SNS_RANK_PAGE_SIZE,
           0,
-          [normalizedUsername],
+          buildTimelineTargetUsernames(normalizedUsername, ...(nextTarget.candidateUsernames || [])),
           '',
           undefined,
           endTime
@@ -339,9 +346,10 @@ export function ContactSnsTimelineDialog({
     void loadTimelinePosts({
       username: targetUsername,
       displayName: targetDisplayName,
-      avatarUrl: targetAvatarUrl
+      avatarUrl: targetAvatarUrl,
+      candidateUsernames: targetUsernames
     }, { reset: true })
-  }, [loadTimelinePosts, targetAvatarUrl, targetDisplayName, targetUsername])
+  }, [loadTimelinePosts, targetAvatarUrl, targetDisplayName, targetUsername, targetUsernames])
 
   useEffect(() => {
     if (!targetUsername) return
@@ -364,7 +372,8 @@ export function ContactSnsTimelineDialog({
     void loadTimelineTotalPosts({
       username: targetUsername,
       displayName: targetDisplayName,
-      avatarUrl: targetAvatarUrl
+      avatarUrl: targetAvatarUrl,
+      candidateUsernames: targetUsernames
     })
   }, [
     initialTotalPosts,
@@ -372,7 +381,8 @@ export function ContactSnsTimelineDialog({
     loadTimelineTotalPosts,
     targetAvatarUrl,
     targetDisplayName,
-    targetUsername
+    targetUsername,
+    targetUsernames
   ])
 
   useEffect(() => {
@@ -387,9 +397,10 @@ export function ContactSnsTimelineDialog({
     void loadRankings({
       username: targetUsername,
       displayName: targetDisplayName,
-      avatarUrl: targetAvatarUrl
+      avatarUrl: targetAvatarUrl,
+      candidateUsernames: targetUsernames
     })
-  }, [loadRankings, rankMode, targetAvatarUrl, targetDisplayName, targetUsername])
+  }, [loadRankings, rankMode, targetAvatarUrl, targetDisplayName, targetUsername, targetUsernames])
 
   useEffect(() => {
     if (!targetUsername) return
@@ -429,13 +440,15 @@ export function ContactSnsTimelineDialog({
     void loadTimelinePosts({
       username: targetUsername,
       displayName: targetDisplayName,
-      avatarUrl: targetAvatarUrl
+      avatarUrl: targetAvatarUrl,
+      candidateUsernames: targetUsernames
     }, { reset: false })
   }, [
     loadTimelinePosts,
     targetAvatarUrl,
     targetDisplayName,
     targetUsername,
+    targetUsernames,
     timelineHasMore,
     timelineLoading,
     timelineLoadingMore

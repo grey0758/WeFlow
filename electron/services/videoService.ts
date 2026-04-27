@@ -68,6 +68,81 @@ class VideoService {
         return trimmed
     }
 
+    private getFallbackHardlinkDbCandidates(wxid: string): string[] {
+        const tempRoot = join(require('os').tmpdir(), 'weflow_decrypted')
+        if (!existsSync(tempRoot)) return []
+
+        const accountNames = Array.from(new Set([wxid, this.cleanWxid(wxid)])).filter(Boolean)
+        const candidates: { path: string; mtimeMs: number }[] = []
+
+        try {
+            for (const entry of readdirSync(tempRoot)) {
+                const runtimeDir = join(tempRoot, entry)
+                let runtimeStat: ReturnType<typeof statSync>
+                try {
+                    runtimeStat = statSync(runtimeDir)
+                } catch {
+                    continue
+                }
+                if (!runtimeStat.isDirectory()) continue
+
+                for (const accountName of accountNames) {
+                    const dbPath = join(runtimeDir, accountName, 'hardlink', 'de_hardlink.db')
+                    if (!existsSync(dbPath)) continue
+                    try {
+                        candidates.push({ path: dbPath, mtimeMs: statSync(dbPath).mtimeMs })
+                    } catch {}
+                }
+            }
+        } catch {}
+
+        return candidates
+            .sort((left, right) => right.mtimeMs - left.mtimeMs)
+            .map((item) => item.path)
+    }
+
+    private queryFallbackHardlinkDb(md5: string, wxid: string): string | undefined {
+        const candidates = this.getFallbackHardlinkDbCandidates(wxid)
+        if (candidates.length === 0) {
+            this.log('fallback de_hardlink.db 未找到', { md5, wxid })
+            return undefined
+        }
+
+        try {
+            const BetterSqlite3 = require('better-sqlite3')
+            for (const candidate of candidates) {
+                let db: any = null
+                try {
+                    db = new BetterSqlite3(candidate, { readonly: true, fileMustExist: true })
+                    const videoRow = db.prepare(
+                        'SELECT file_name FROM video_hardlink_info_v4 WHERE md5 = ? LIMIT 1'
+                    ).get(md5)
+                    const fallbackRow = videoRow || db.prepare(
+                        'SELECT file_name FROM file_hardlink_info_v4 WHERE md5 = ? LIMIT 1'
+                    ).get(md5)
+
+                    if (fallbackRow?.file_name) {
+                        const realMd5 = String(fallbackRow.file_name).replace(/\.[^.]+$/, '')
+                        this.log('fallback de_hardlink.db 命中', { path: candidate, file_name: fallbackRow.file_name, realMd5 })
+                        return realMd5
+                    }
+
+                    this.log('fallback de_hardlink.db 未命中', { path: candidate, md5 })
+                } catch (error) {
+                    this.log('fallback de_hardlink.db 查询失败', { path: candidate, md5, error: String(error) })
+                } finally {
+                    if (db) {
+                        try { db.close() } catch {}
+                    }
+                }
+            }
+        } catch (error) {
+            this.log('fallback de_hardlink.db 初始化失败', { md5, error: String(error) })
+        }
+
+        return undefined
+    }
+
     /**
      * 从 video_hardlink_info_v4 表查询视频文件名
      * 使用 wcdbService.execQuery 查询加密的 hardlink.db
@@ -123,6 +198,10 @@ class VideoService {
                     this.log('加密 hardlink.db 不存在', { path: p })
                 }
             }
+        }
+        const fallbackResolved = this.queryFallbackHardlinkDb(md5, wxid)
+        if (fallbackResolved) {
+            return fallbackResolved
         }
         this.log('queryVideoFileName: 所有方法均未找到', { md5 })
         return undefined

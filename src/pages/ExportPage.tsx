@@ -47,6 +47,7 @@ import { useAppStore } from '../stores/appStore'
 import { useContactTypeCountsStore } from '../stores/contactTypeCountsStore'
 import { SnsPostItem } from '../components/Sns/SnsPostItem'
 import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
+import { buildTimelineTargetUsernames } from '../components/Sns/contactSnsTimeline'
 import { ExportDateRangeDialog } from '../components/Export/ExportDateRangeDialog'
 import { ExportDefaultsSettingsForm, type ExportDefaultsSettingsPatch } from '../components/Export/ExportDefaultsSettingsForm'
 import type { SnsPost } from '../types/sns'
@@ -591,6 +592,7 @@ interface SessionSnsTimelineTarget {
   username: string
   displayName: string
   avatarUrl?: string
+  candidateUsernames?: string[]
 }
 
 interface SessionSnsRankItem {
@@ -2434,7 +2436,8 @@ function ExportPage() {
     const target: SessionSnsTimelineTarget = {
       username: normalizedSessionId,
       displayName: sessionDetail.displayName || sessionDetail.remark || sessionDetail.nickName || normalizedSessionId,
-      avatarUrl: sessionDetail.avatarUrl
+      avatarUrl: sessionDetail.avatarUrl,
+      candidateUsernames: buildTimelineTargetUsernames(normalizedSessionId, sessionDetail.alias)
     }
 
     openSessionSnsTimelineByTarget(target)
@@ -2446,7 +2449,8 @@ function ExportPage() {
     openSessionSnsTimelineByTarget({
       username: normalizedSessionId,
       displayName: contact.displayName || contact.remark || contact.nickname || normalizedSessionId,
-      avatarUrl: contact.avatarUrl
+      avatarUrl: contact.avatarUrl,
+      candidateUsernames: buildTimelineTargetUsernames(normalizedSessionId, contact.alias)
     })
   }, [openSessionSnsTimelineByTarget])
 

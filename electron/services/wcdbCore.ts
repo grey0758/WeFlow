@@ -1119,6 +1119,7 @@ export class WcdbCore {
       'session':  ['de_session.db', 'de_Session.db'],
       'contact':  ['de_contact.db', 'de_Contact.db', 'de_session.db'],
       'message':  ['de_message_0.db', 'de_msg_0.db'],
+      'media':    ['de_hardlink.db', 'de_emoticon.db', 'de_head_image.db', 'de_favorite.db'],
       'misc':     ['de_misc.db', 'de_Misc.db'],
       'sns':      ['de_SNS.db', 'de_sns.db'],
     }
@@ -3194,9 +3195,25 @@ export class WcdbCore {
   /** Parse a Weixin 4.x SnsTimeLine raw row (tid, user_name, content XML) into the structured format snsService expects */
   private parseSnsTimelineRow4x(row: any): any {
     const xml: string = row.content || ''
-    const get = (tag: string) => {
-      const m = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'))
-      return m ? m[1].trim() : ''
+    const decodeXmlValue = (value: string) => value
+      .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .trim()
+    const get = (tag: string, source: string = xml) => {
+      const m = source.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, 'i'))
+      return m ? decodeXmlValue(m[1]) : ''
+    }
+    const getTag = (tag: string, source: string = xml): { attrs: string; text: string } => {
+      const m = source.match(new RegExp(`<${tag}([^>]*)>([\\s\\S]*?)<\\/${tag}>`, 'i'))
+      return m ? { attrs: m[1] || '', text: decodeXmlValue(m[2] || '') } : { attrs: '', text: '' }
+    }
+    const getAttr = (attrs: string, name: string) => {
+      const m = attrs.match(new RegExp(`${name}="([^"]*)"`, 'i'))
+      return m ? decodeXmlValue(m[1]) : ''
     }
     const getInt = (tag: string) => { const v = get(tag); return v ? parseInt(v, 10) : 0 }
 
@@ -3208,14 +3225,47 @@ export class WcdbCore {
       let m: RegExpExecArray | null
       while ((m = mediaItemRegex.exec(mediaListMatch[1])) !== null) {
         const mx = m[1]
-        const getM = (tag: string) => { const r = mx.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i')); return r ? r[1].trim().replace(/&amp;/g, '&') : '' }
-        const url = getM('url') || getM('thumbUrl') || getM('cdnUrl')
-        const thumb = getM('thumbUrl') || getM('url')
-        const token = getM('token')
-        const encUrl = getM('encryptUrl') || getM('encrypt_url')
-        const aesKey = getM('aesKey') || getM('aes_key')
-        const mediaType = parseInt(getM('type') || '0', 10)
-        if (url || encUrl) media.push({ url, thumb, token, encryptUrl: encUrl || undefined, aesKey: aesKey || undefined, type: mediaType })
+        const urlTag = getTag('url', mx)
+        const thumbTag = getTag('thumb', mx)
+        const thumbUrlTag = getTag('thumbUrl', mx)
+        const lowBandUrlTag = getTag('lowBandUrl', mx)
+        const cdnUrlTag = getTag('cdnUrl', mx)
+        const liveMediaMatch = mx.match(/<LivePhoto>[\s\S]*?<liveMedia>([\s\S]*?)<\/liveMedia>[\s\S]*?<\/LivePhoto>/i)
+        const liveMedia = liveMediaMatch ? liveMediaMatch[1] : ''
+        const liveUrlTag = liveMedia ? getTag('url', liveMedia) : { attrs: '', text: '' }
+        const liveThumbTag = liveMedia ? getTag('thumb', liveMedia) : { attrs: '', text: '' }
+
+        const url = urlTag.text || lowBandUrlTag.text || cdnUrlTag.text
+        const thumb = thumbTag.text || thumbUrlTag.text || url
+        const token = getAttr(urlTag.attrs, 'token') || getAttr(thumbTag.attrs, 'token') || get('token', mx)
+        const encIdx = getAttr(urlTag.attrs, 'enc_idx') || getAttr(thumbTag.attrs, 'enc_idx')
+        const key = getAttr(urlTag.attrs, 'key') || getAttr(thumbTag.attrs, 'key')
+        const md5 = getAttr(urlTag.attrs, 'md5') || getAttr(urlTag.attrs, 'videomd5')
+        const encUrl = get('encryptUrl', mx) || get('encrypt_url', mx)
+        const aesKey = get('aesKey', mx) || get('aes_key', mx)
+        const mediaType = parseInt(get('type', mx) || '0', 10)
+        const livePhoto = liveUrlTag.text
+          ? {
+            url: liveUrlTag.text,
+            thumb: liveThumbTag.text || thumb,
+            md5: getAttr(liveUrlTag.attrs, 'md5') || undefined,
+            token: getAttr(liveUrlTag.attrs, 'token') || undefined,
+            key: getAttr(liveUrlTag.attrs, 'key') || undefined,
+            encIdx: getAttr(liveUrlTag.attrs, 'enc_idx') || undefined
+          }
+          : undefined
+        if (url || encUrl) media.push({
+          url,
+          thumb,
+          md5: md5 || undefined,
+          token: token || undefined,
+          key: key || undefined,
+          encIdx: encIdx || undefined,
+          encryptUrl: encUrl || undefined,
+          aesKey: aesKey || undefined,
+          type: mediaType,
+          livePhoto
+        })
       }
     }
 
@@ -3232,6 +3282,7 @@ export class WcdbCore {
       nickname,
       createTime,
       type,
+      contentDesc,
       content: contentDesc,
       rawXml: xml,
       media,
@@ -3240,17 +3291,88 @@ export class WcdbCore {
     }
   }
 
+  private normalizeTimelineUsername(value: unknown): string {
+    const raw = typeof value === 'string' ? value.trim() : String(value || '').trim()
+    if (!raw) return ''
+
+    if (raw.toLowerCase().startsWith('wxid_')) {
+      const match = raw.match(/^(wxid_[^_]+)/i)
+      return match ? match[1].toLowerCase() : raw.toLowerCase()
+    }
+
+    const suffixMatch = raw.match(/^(.+)_([a-zA-Z0-9]{4})$/)
+    if (suffixMatch) return suffixMatch[1].toLowerCase()
+
+    return raw.toLowerCase()
+  }
+
+  private pickTimelineSortValue(post: any): number {
+    const createTime = Number(post?.createTime ?? post?.CreateTime ?? 0)
+    if (Number.isFinite(createTime) && createTime > 0) return createTime
+    const tid = Number(post?.tid ?? 0)
+    return Number.isFinite(tid) ? tid : 0
+  }
+
+  private filterFallbackTimeline(
+    timeline: any[],
+    usernames?: string[],
+    keyword?: string,
+    startTime?: number,
+    endTime?: number
+  ): any[] {
+    if (!Array.isArray(timeline) || timeline.length === 0) return []
+
+    const normalizedUsernames = new Set(
+      (usernames || [])
+        .map((item) => this.normalizeTimelineUsername(item))
+        .filter(Boolean)
+    )
+    const normalizedKeyword = String(keyword || '').trim().toLowerCase()
+    const start = Number(startTime || 0)
+    const end = Number(endTime || 0)
+
+    return timeline.filter((post) => {
+      const username = String(post?.username ?? post?.user_name ?? post?.userName ?? '').trim()
+      if (normalizedUsernames.size > 0) {
+        const normalizedPostUsername = this.normalizeTimelineUsername(username)
+        if (!normalizedPostUsername || !normalizedUsernames.has(normalizedPostUsername)) {
+          return false
+        }
+      }
+
+      const createTime = Number(post?.createTime ?? post?.CreateTime ?? 0)
+      if (start > 0 && Number.isFinite(createTime) && createTime < start) return false
+      if (end > 0 && Number.isFinite(createTime) && createTime > end) return false
+
+      if (normalizedKeyword) {
+        const haystack = [
+          post?.content,
+          post?.Content,
+          post?.nickname,
+          post?.NickName,
+          post?.rawXml
+        ]
+          .map((item) => String(item || ''))
+          .join('\n')
+          .toLowerCase()
+        if (!haystack.includes(normalizedKeyword)) return false
+      }
+
+      return true
+    })
+  }
+
   async getSnsTimeline(limit: number, offset: number, usernames?: string[], keyword?: string, startTime?: number, endTime?: number): Promise<{ success: boolean; timeline?: any[]; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
     // fallback 模式
     if (this.fallbackMode) {
       const sqlCandidates = [
         // Weixin 4.x
-        `SELECT * FROM SnsTimeLine ORDER BY tid DESC LIMIT ${limit} OFFSET ${offset}`,
+        `SELECT * FROM SnsTimeLine ORDER BY tid DESC`,
         // Weixin 3.x
-        `SELECT * FROM FeedsV20 ORDER BY createTime DESC LIMIT ${limit} OFFSET ${offset}`,
-        `SELECT * FROM Feeds ORDER BY createTime DESC LIMIT ${limit} OFFSET ${offset}`,
-        `SELECT * FROM SnsInfo ORDER BY createTime DESC LIMIT ${limit} OFFSET ${offset}`,
+        `SELECT * FROM FeedsV20 ORDER BY createTime DESC`,
+        `SELECT * FROM Feeds ORDER BY createTime DESC`,
+        `SELECT * FROM SnsInfo ORDER BY createTime DESC`,
       ]
       for (const sql of sqlCandidates) {
         const r = this.execQueryFallback('sns', null, sql)
@@ -3259,9 +3381,13 @@ export class WcdbCore {
         // If rows have 'tid' and 'user_name' it's Weixin 4.x raw XML — needs transformation
         if (rows.length > 0 && rows[0].user_name !== undefined && rows[0].content !== undefined) {
           const timeline = rows.map((row: any) => this.parseSnsTimelineRow4x(row))
-          return { success: true, timeline }
+          const filtered = this.filterFallbackTimeline(timeline, usernames, keyword, startTime, endTime)
+            .sort((left, right) => this.pickTimelineSortValue(right) - this.pickTimelineSortValue(left))
+          return { success: true, timeline: filtered.slice(offset, offset + limit) }
         }
-        return { success: true, timeline: rows }
+        const filtered = this.filterFallbackTimeline(rows, usernames, keyword, startTime, endTime)
+          .sort((left, right) => this.pickTimelineSortValue(right) - this.pickTimelineSortValue(left))
+        return { success: true, timeline: filtered.slice(offset, offset + limit) }
       }
       return { success: true, timeline: [] }
     }

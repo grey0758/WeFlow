@@ -6,7 +6,7 @@ import { toContactTypeCardCounts, useContactTypeCountsStore } from '../stores/co
 import * as configService from '../services/config'
 import type { ContactInfo } from '../types/models'
 import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
-import { type ContactSnsTimelineTarget, isSingleContactSession } from '../components/Sns/contactSnsTimeline'
+import { buildTimelineTargetUsernames, type ContactSnsTimelineTarget, isSingleContactSession } from '../components/Sns/contactSnsTimeline'
 import './ContactsPage.scss'
 
 interface ContactEnrichInfo {
@@ -639,7 +639,8 @@ function ContactsPage() {
         setSnsTimelineTarget({
             username: selectedContact.username,
             displayName: selectedContact.displayName || selectedContact.remark || selectedContact.nickname || selectedContact.username,
-            avatarUrl: selectedContact.avatarUrl
+            avatarUrl: selectedContact.avatarUrl,
+            candidateUsernames: buildTimelineTargetUsernames(selectedContact.username, selectedContact.alias)
         })
     }, [loadSnsUserPostCounts, selectedContact, selectedContactSupportsSns, snsUserPostCountsStatus])
 

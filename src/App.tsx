@@ -353,12 +353,13 @@ function App() {
 
     const autoConnect = async () => {
       try {
-        const dbPath = await configService.getDbPath()
-        const decryptKey = await configService.getDecryptKey()
-        const wxid = await configService.getMyWxid()
+        const prepared = await window.electronAPI.startup.autoPrepare()
+        const dbPath = prepared.dbPath || await configService.getDbPath()
+        const decryptKey = prepared.decryptKey || await configService.getDecryptKey()
+        const wxid = prepared.wxid || await configService.getMyWxid()
         const onboardingDone = await configService.getOnboardingDone()
         const wxidConfig = wxid ? await configService.getWxidConfig(wxid) : null
-        const wcdbKeys = await configService.getWcdbKeys()
+        const wcdbKeys = prepared.wcdbKeys || await configService.getWcdbKeys()
         const effectiveDecryptKey = wxidConfig?.decryptKey || decryptKey
 
         if (wxidConfig?.decryptKey && wxidConfig.decryptKey !== decryptKey) {

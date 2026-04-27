@@ -74,6 +74,58 @@ async function waitForDevServerReady(timeoutMs = 30000, intervalMs = 250): Promi
   console.warn('[WeFlow] Dev server was not ready before window creation:', lastError)
 }
 
+const avatarProxyHosts = ['qlogo.cn', 'qpic.cn', 'qq.com', 'wechat.com', 'weixin.qq.com']
+
+function isAllowedAvatarProxyUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl)
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false
+    const host = parsed.hostname.toLowerCase()
+    return avatarProxyHosts.some((allowed) => host === allowed || host.endsWith(`.${allowed}`))
+  } catch {
+    return false
+  }
+}
+
+async function fetchAvatarDataUrl(url: string): Promise<{ success: boolean; dataUrl?: string; error?: string }> {
+  const normalizedUrl = String(url || '').trim()
+  if (!isAllowedAvatarProxyUrl(normalizedUrl)) {
+    return { success: false, error: '不支持的头像域名' }
+  }
+
+  try {
+    const response = await fetch(normalizedUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) WindowsWechat(0x63090719) XWEB/8351',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Referer': 'https://servicewechat.com/'
+      },
+      signal: AbortSignal.timeout(8000)
+    })
+
+    if (!response.ok) {
+      return { success: false, error: `头像下载失败: HTTP ${response.status}` }
+    }
+
+    const contentType = response.headers.get('content-type')?.split(';')[0]?.trim() || 'image/jpeg'
+    if (!contentType.toLowerCase().startsWith('image/')) {
+      return { success: false, error: `头像响应不是图片: ${contentType}` }
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer())
+    if (buffer.length > 5 * 1024 * 1024) {
+      return { success: false, error: '头像文件过大' }
+    }
+
+    return {
+      success: true,
+      dataUrl: `data:${contentType};base64,${buffer.toString('base64')}`
+    }
+  } catch (error) {
+    return { success: false, error: String(error) }
+  }
+}
+
 function loadDevWindowURL(win: BrowserWindow, url: string, maxRetries = 40, retryDelayMs = 250) {
   const normalizedUrl = normalizeLoopbackUrl(url)
   let attempts = 0
@@ -1018,6 +1070,145 @@ const buildAccountNameMatcher = (wxidCandidates: string[]) => {
   }
 }
 
+type StartupAutoPrepareResult = {
+  success: boolean
+  dbPath?: string
+  wxid?: string
+  decryptKey?: string
+  wcdbKeys?: Record<string, string>
+  keyReady: boolean
+  wechatRunning: boolean
+  waitingForWeChat: boolean
+  suggestAdmin: boolean
+  autoDetectedPath: boolean
+  autoDetectedWxid: boolean
+  source?: 'pywxdump' | 'native' | 'dll'
+  message?: string
+  error?: string
+  logs?: string[]
+}
+
+const pickPreferredWxid = (rootPath: string, currentWxid?: string | null) => {
+  const wxids = dbPathService.scanWxids(rootPath)
+  if (wxids.length === 0) return null
+
+  const trimmedCurrent = String(currentWxid || '').trim()
+  if (!trimmedCurrent) return wxids[0]
+
+  const normalizedCurrent = normalizeAccountId(trimmedCurrent).toLowerCase()
+  return wxids.find((item) => {
+    const candidate = String(item.wxid || '').trim().toLowerCase()
+    return candidate === trimmedCurrent.toLowerCase() || normalizeAccountId(candidate) === normalizedCurrent
+  }) || wxids[0]
+}
+
+const inferSuggestAdmin = (error?: string | null): boolean => {
+  const text = String(error || '').toLowerCase()
+  return text.includes('access is denied') || text.includes('拒绝访问') || text.includes('权限') || text.includes('5)')
+}
+
+async function autoPrepareStartupState(
+  notifyStatus?: (message: string, level: number) => void
+): Promise<StartupAutoPrepareResult> {
+  const cfg = configService || new ConfigService()
+  let dbPath = String(cfg.get('dbPath') || '').trim()
+  let wxid = String(cfg.get('myWxid') || '').trim()
+  let decryptKey = String(cfg.get('decryptKey') || '').trim()
+  let wcdbKeys = (cfg.get('wcdbKeys') as Record<string, string> | undefined) || {}
+  let autoDetectedPath = false
+  let autoDetectedWxid = false
+
+  if (!dbPath || !existsSync(dbPath)) {
+    const detected = await dbPathService.autoDetect()
+    if (detected.success && detected.path) {
+      dbPath = detected.path
+      cfg.set('dbPath' as any, dbPath)
+      autoDetectedPath = true
+    }
+  }
+
+  if (dbPath && existsSync(dbPath)) {
+    const preferred = pickPreferredWxid(dbPath, wxid)
+    if (preferred?.wxid) {
+      const nextWxid = String(preferred.wxid).trim()
+      if (nextWxid && nextWxid !== wxid) {
+        wxid = nextWxid
+        cfg.set('myWxid' as any, wxid)
+        autoDetectedWxid = true
+      }
+    }
+  }
+
+  let keyReady = Boolean(decryptKey) || Object.keys(wcdbKeys).length > 0
+  const keyServiceAny = keyService as any
+  const wechatPid = await keyServiceAny.findWeChatPid()
+  const wechatRunning = Boolean(wechatPid)
+
+  if (!keyReady && wechatRunning) {
+    const keyResult = await keyService.autoGetDbKey(90_000, (message, level) => notifyStatus?.(message, level))
+    if (keyResult.success) {
+      decryptKey = String(keyResult.key || '').trim()
+      wcdbKeys = keyResult.wcdbKeys || {}
+      if (decryptKey) cfg.set('decryptKey' as any, decryptKey)
+      if (Object.keys(wcdbKeys).length > 0) cfg.set('wcdbKeys' as any, wcdbKeys)
+      keyReady = Boolean(decryptKey) || Object.keys(wcdbKeys).length > 0
+      return {
+        success: true,
+        dbPath,
+        wxid,
+        decryptKey: decryptKey || undefined,
+        wcdbKeys,
+        keyReady,
+        wechatRunning,
+        waitingForWeChat: false,
+        suggestAdmin: false,
+        autoDetectedPath,
+        autoDetectedWxid,
+        source: keyResult.source,
+        logs: keyResult.logs,
+        message: keyReady
+          ? '已自动检测数据库路径和当前账号，并成功获取密钥'
+          : '已自动检测数据库路径和当前账号'
+      }
+    }
+
+    return {
+      success: false,
+      dbPath: dbPath || undefined,
+      wxid: wxid || undefined,
+      decryptKey: decryptKey || undefined,
+      wcdbKeys,
+      keyReady: false,
+      wechatRunning,
+      waitingForWeChat: false,
+      suggestAdmin: inferSuggestAdmin(keyResult.error),
+      autoDetectedPath,
+      autoDetectedWxid,
+      source: keyResult.source,
+      logs: keyResult.logs,
+      error: keyResult.error,
+      message: keyResult.error || '自动获取密钥失败'
+    }
+  }
+
+  return {
+    success: true,
+    dbPath: dbPath || undefined,
+    wxid: wxid || undefined,
+    decryptKey: decryptKey || undefined,
+    wcdbKeys,
+    keyReady,
+    wechatRunning,
+    waitingForWeChat: !keyReady && !wechatRunning,
+    suggestAdmin: false,
+    autoDetectedPath,
+    autoDetectedWxid,
+    message: keyReady
+      ? '检测到可用配置，启动后将直接连接'
+      : (!wechatRunning ? '未检测到微信运行，已进入等待；微信启动并登录后会自动继续扫描' : '已检测到微信运行，等待自动扫描密钥')
+  }
+}
+
 const removePathIfExists = async (
   targetPath: string,
   removedPaths: string[],
@@ -1444,6 +1635,12 @@ function registerIpcHandlers() {
     return dbPathService.getDefaultPath()
   })
 
+  ipcMain.handle('startup:autoPrepare', async (event) => {
+    return autoPrepareStartupState((message, level) => {
+      event.sender.send('key:dbKeyStatus', { message, level })
+    })
+  })
+
   // WCDB 数据库相关
   ipcMain.handle('wcdb:testConnection', async (_, dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) => {
     if (wcdbKeys && Object.keys(wcdbKeys).length > 0) {
@@ -1530,6 +1727,10 @@ function registerIpcHandlers() {
 
   ipcMain.handle('chat:getContactAvatar', async (_, username: string) => {
     return await chatService.getContactAvatar(username)
+  })
+
+  ipcMain.handle('chat:fetchAvatarDataUrl', async (_, url: string) => {
+    return await fetchAvatarDataUrl(url)
   })
 
   ipcMain.handle('chat:resolveTransferDisplayNames', async (_, chatroomId: string, payerUsername: string, receiverUsername: string) => {

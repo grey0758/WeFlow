@@ -5,7 +5,7 @@ import { SnsPost } from '../types/sns'
 import { SnsPostItem } from '../components/Sns/SnsPostItem'
 import { SnsFilterPanel } from '../components/Sns/SnsFilterPanel'
 import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
-import type { ContactSnsTimelineTarget } from '../components/Sns/contactSnsTimeline'
+import { buildTimelineTargetUsernames, normalizeTimelineAccountId, type ContactSnsTimelineTarget } from '../components/Sns/contactSnsTimeline'
 import JumpToDatePopover from '../components/JumpToDatePopover'
 import { ExportDateRangeDialog } from '../components/Export/ExportDateRangeDialog'
 import * as configService from '../services/config'
@@ -85,16 +85,7 @@ const readSidebarUserProfileCache = (): SidebarUserProfile | null => {
     }
 }
 
-const normalizeAccountId = (value?: string | null): string => {
-    const trimmed = String(value || '').trim()
-    if (!trimmed) return ''
-    if (trimmed.toLowerCase().startsWith('wxid_')) {
-        const match = trimmed.match(/^(wxid_[^_]+)/i)
-        return (match?.[1] || trimmed).toLowerCase()
-    }
-    const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
-    return (suffixMatch ? suffixMatch[1] : trimmed).toLowerCase()
-}
+const normalizeAccountId = normalizeTimelineAccountId
 
 const normalizeNameForCompare = (value?: string | null): string => String(value || '').trim().toLowerCase()
 
@@ -388,9 +379,9 @@ export default function SnsPage() {
     }, [contacts, currentUserProfile.alias, currentUserProfile.displayName, currentUserProfile.wxid])
 
     const currentTimelineTargetContact = useMemo(() => {
-        const normalizedTargetUsername = String(authorTimelineTarget?.username || '').trim()
+        const normalizedTargetUsername = normalizeAccountId(authorTimelineTarget?.username)
         if (!normalizedTargetUsername) return null
-        return contacts.find((contact) => contact.username === normalizedTargetUsername) || null
+        return contacts.find((contact) => normalizeAccountId(contact.username) === normalizedTargetUsername) || null
     }, [authorTimelineTarget, contacts])
 
     const exportSelectedContactsSummary = useMemo(() => {
@@ -1118,18 +1109,22 @@ export default function SnsPage() {
     }, [])
 
     const openAuthorTimeline = useCallback((post: SnsPost) => {
+        const normalizedPostUsername = normalizeAccountId(post.username)
+        const matchedContact = contacts.find((contact) => normalizeAccountId(contact.username) === normalizedPostUsername) || null
         setAuthorTimelineTarget({
             username: post.username,
             displayName: decodeHtmlEntities(post.nickname || '') || post.username,
-            avatarUrl: post.avatarUrl
+            avatarUrl: post.avatarUrl || matchedContact?.avatarUrl,
+            candidateUsernames: buildTimelineTargetUsernames(post.username, matchedContact?.username)
         })
-    }, [decodeHtmlEntities])
+    }, [contacts, decodeHtmlEntities])
 
     const openContactTimeline = useCallback((contact: Contact) => {
         setAuthorTimelineTarget({
             username: contact.username,
             displayName: contact.displayName || contact.username,
-            avatarUrl: contact.avatarUrl
+            avatarUrl: contact.avatarUrl,
+            candidateUsernames: buildTimelineTargetUsernames(contact.username)
         })
     }, [])
 

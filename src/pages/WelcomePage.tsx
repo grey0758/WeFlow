@@ -33,6 +33,24 @@ interface DbRuntimeStatus {
   dllCompatEnabled: boolean
 }
 
+interface StartupAutoPrepareResult {
+  success: boolean
+  dbPath?: string
+  wxid?: string
+  decryptKey?: string
+  wcdbKeys?: Record<string, string>
+  keyReady: boolean
+  wechatRunning: boolean
+  waitingForWeChat: boolean
+  suggestAdmin: boolean
+  autoDetectedPath: boolean
+  autoDetectedWxid: boolean
+  source?: 'pywxdump' | 'native' | 'dll'
+  message?: string
+  error?: string
+  logs?: string[]
+}
+
 const formatDbKeyFailureMessage = (error?: string, logs?: string[]): string => {
   const rawBase = String(error || '自动获取密钥失败').trim()
   const base = rawBase.includes('DLL 取钥需要在登录过程中抓取')
@@ -110,6 +128,7 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
   const [isManualStartPrompt, setIsManualStartPrompt] = useState(false)
   const [imageKeyPercent, setImageKeyPercent] = useState<number | null>(null)
   const [showDbKeyConfirm, setShowDbKeyConfirm] = useState(false)
+  const autoPrepareTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // 安全相关 state
   const [enableAuth, setEnableAuth] = useState(false)
@@ -231,6 +250,84 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
       navigate('/home')
     }
   }, [isDbConnected, standalone, navigate])
+
+  useEffect(() => {
+    let disposed = false
+
+    const clearRetry = () => {
+      if (autoPrepareTimerRef.current) {
+        clearTimeout(autoPrepareTimerRef.current)
+        autoPrepareTimerRef.current = null
+      }
+    }
+
+    const applyPreparedState = async (prepared: StartupAutoPrepareResult) => {
+      if (disposed) return
+      if (prepared.dbPath) setDbPath(prepared.dbPath)
+      if (prepared.wxid) setWxid(prepared.wxid)
+      if (prepared.decryptKey) setDecryptKey(prepared.decryptKey)
+      if (prepared.wcdbKeys && Object.keys(prepared.wcdbKeys).length > 0) {
+        setWcdbKeys(prepared.wcdbKeys)
+        setDecryptKey('')
+      }
+
+      if (prepared.dbPath) {
+        const wxids = await window.electronAPI.dbPath.scanWxids(prepared.dbPath)
+        if (!disposed) setWxidOptions(wxids)
+      }
+
+      if (prepared.keyReady) {
+        const sourceLabel = getDbKeySourceLabel(prepared.source)
+        setDbKeyStatus(prepared.source
+          ? `已自动获取密钥（${sourceLabel}）`
+          : '已检测到可用密钥')
+        setError('')
+        clearRetry()
+        return
+      }
+
+      if (prepared.waitingForWeChat) {
+        const adminHint = prepared.suggestAdmin ? '；如果微信是管理员运行，请也用管理员模式启动 WeFlow' : ''
+        setDbKeyStatus(`未检测到微信运行，已等待自动扫描${adminHint}`)
+        clearRetry()
+        autoPrepareTimerRef.current = setTimeout(() => {
+          void runAutoPrepare(true)
+        }, 3000)
+        return
+      }
+
+      if (prepared.message) {
+        setDbKeyStatus(prepared.message)
+      }
+      if (!prepared.success && prepared.error) {
+        const adminHint = prepared.suggestAdmin ? '；如果微信是管理员运行，请也用管理员模式启动 WeFlow' : ''
+        setError(`${formatDbKeyFailureMessage(prepared.error, prepared.logs)}${adminHint}`)
+      }
+    }
+
+    const runAutoPrepare = async (silent = false) => {
+      if (disposed) return
+      if (!silent) {
+        setDbKeyStatus('正在自动检查微信、数据库路径与密钥状态...')
+      }
+      try {
+        const prepared = await window.electronAPI.startup.autoPrepare()
+        await applyPreparedState(prepared)
+      } catch (e) {
+        if (!disposed) {
+          setDbKeyStatus('自动检查失败')
+          setError(`自动检查失败: ${e}`)
+        }
+      }
+    }
+
+    void runAutoPrepare()
+
+    return () => {
+      disposed = true
+      clearRetry()
+    }
+  }, [])
 
   useEffect(() => {
     setWxidOptions([])

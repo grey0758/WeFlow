@@ -135,6 +135,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getDefault: () => ipcRenderer.invoke('dbpath:getDefault')
   },
 
+  startup: {
+    autoPrepare: () => ipcRenderer.invoke('startup:autoPrepare')
+  },
+
   // WCDB 数据库
   wcdb: {
     testConnection: (dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) =>
@@ -181,6 +185,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('chat:getNewMessages', sessionId, minTime, limit),
     getContact: (username: string) => ipcRenderer.invoke('chat:getContact', username),
     getContactAvatar: (username: string) => ipcRenderer.invoke('chat:getContactAvatar', username),
+    fetchAvatarDataUrl: (url: string) => ipcRenderer.invoke('chat:fetchAvatarDataUrl', url),
     updateMessage: (sessionId: string, localId: number, createTime: number, newContent: string) =>
       ipcRenderer.invoke('chat:updateMessage', sessionId, localId, createTime, newContent),
     deleteMessage: (sessionId: string, localId: number, createTime: number, dbPathHint?: string) =>

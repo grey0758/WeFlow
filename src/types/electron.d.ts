@@ -135,6 +135,25 @@ export interface ElectronAPI {
     scanWxidCandidates: (rootPath: string) => Promise<WxidInfo[]>
     getDefault: () => Promise<string>
   }
+  startup: {
+    autoPrepare: () => Promise<{
+      success: boolean
+      dbPath?: string
+      wxid?: string
+      decryptKey?: string
+      wcdbKeys?: Record<string, string>
+      keyReady: boolean
+      wechatRunning: boolean
+      waitingForWeChat: boolean
+      suggestAdmin: boolean
+      autoDetectedPath: boolean
+      autoDetectedWxid: boolean
+      source?: 'pywxdump' | 'native' | 'dll'
+      message?: string
+      error?: string
+      logs?: string[]
+    }>
+  }
   wcdb: {
     testConnection: (dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) => Promise<{ success: boolean; error?: string; sessionCount?: number }>
     open: (dbPath: string, hexKey: string, wxid: string, wcdbKeys?: Record<string, string>) => Promise<boolean>
@@ -228,6 +247,7 @@ export interface ElectronAPI {
     }>
     getContact: (username: string) => Promise<Contact | null>
     getContactAvatar: (username: string) => Promise<{ avatarUrl?: string; displayName?: string } | null>
+    fetchAvatarDataUrl: (url: string) => Promise<{ success: boolean; dataUrl?: string; error?: string }>
     updateMessage: (sessionId: string, localId: number, createTime: number, newContent: string) => Promise<{ success: boolean; error?: string }>
     deleteMessage: (sessionId: string, localId: number, createTime: number, dbPathHint?: string) => Promise<{ success: boolean; error?: string }>
     resolveTransferDisplayNames: (chatroomId: string, payerUsername: string, receiverUsername: string) => Promise<{ payerName: string; receiverName: string }>

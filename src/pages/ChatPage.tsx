@@ -12,7 +12,7 @@ import { LivePhotoIcon } from '../components/LivePhotoIcon'
 import { AnimatedStreamingText } from '../components/AnimatedStreamingText'
 import JumpToDatePopover from '../components/JumpToDatePopover'
 import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
-import { type ContactSnsTimelineTarget, isSingleContactSession } from '../components/Sns/contactSnsTimeline'
+import { buildTimelineTargetUsernames, type ContactSnsTimelineTarget, isSingleContactSession } from '../components/Sns/contactSnsTimeline'
 import * as configService from '../services/config'
 import {
   finishBackgroundTask,
@@ -587,6 +587,7 @@ const SessionItem = React.memo(function SessionItem({
         name={session.displayName || session.username}
         size={48}
         className={session.username.includes('@chatroom') ? 'group' : ''}
+        lazy={!session.username.includes('@chatroom')}
       />
       <div className="session-info">
         <div className="session-top">
@@ -4044,7 +4045,8 @@ function ChatPage(props: ChatPageProps) {
     setChatSnsTimelineTarget({
       username: currentSession.username,
       displayName: currentSession.displayName || currentSession.username,
-      avatarUrl: currentSession.avatarUrl
+      avatarUrl: currentSession.avatarUrl,
+      candidateUsernames: buildTimelineTargetUsernames(currentSession.username, currentSession.alias)
     })
   }, [currentSession, isCurrentSessionPrivateSnsSupported])
 
@@ -5009,6 +5011,7 @@ function ChatPage(props: ChatPageProps) {
                 name={currentSession.displayName || currentSession.username}
                 size={40}
                 className={isCurrentSessionGroup ? 'group session-avatar' : 'session-avatar'}
+                lazy={!isCurrentSessionGroup}
               />
               <div className="header-info">
                 <h3>{currentSession.displayName || currentSession.username}</h3>
@@ -5421,6 +5424,7 @@ function ChatPage(props: ChatPageProps) {
                               name={member.displayName || member.username}
                               size={34}
                               className="group-member-avatar"
+                              lazy={false}
                             />
                             <div className="group-member-meta">
                               <div className="group-member-name-row">

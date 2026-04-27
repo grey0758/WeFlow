@@ -106,7 +106,21 @@ interface ArkmeCommentDetail {
     source: 'xml' | 'legacy'
 }
 
+const dedupeTimelineUsernames = (values: Array<string | undefined | null>): string[] => {
+    const seen = new Set<string>()
+    const result: string[] = []
 
+    for (const value of values) {
+        const trimmed = String(value || '').trim()
+        if (!trimmed) continue
+        const lowered = trimmed.toLowerCase()
+        if (seen.has(lowered)) continue
+        seen.add(lowered)
+        result.push(trimmed)
+    }
+
+    return result
+}
 
 const fixSnsUrl = (url: string, token?: string, isVideo: boolean = false) => {
     if (!url) return url
@@ -514,6 +528,61 @@ class SnsService {
         return raw.trim()
     }
 
+    private normalizeTimelineUsername(value: unknown): string {
+        const raw = typeof value === 'string' ? value.trim() : String(value || '').trim()
+        if (!raw) return ''
+
+        if (raw.toLowerCase().startsWith('wxid_')) {
+            const match = raw.match(/^(wxid_[^_]+)/i)
+            return match ? match[1].toLowerCase() : raw.toLowerCase()
+        }
+
+        const suffixMatch = raw.match(/^(.+)_([a-zA-Z0-9]{4})$/)
+        if (suffixMatch) return suffixMatch[1].toLowerCase()
+
+        return raw.toLowerCase()
+    }
+
+    private expandTimelineCountsAlias(counts: Record<string, number>): Record<string, number> {
+        const expanded: Record<string, number> = { ...counts }
+        for (const [username, total] of Object.entries(counts)) {
+            const normalized = this.normalizeTimelineUsername(username)
+            if (!normalized) continue
+            if (expanded[normalized] === undefined) {
+                expanded[normalized] = total
+            }
+        }
+
+        const configuredMyWxid = this.toOptionalString(this.configService.get('myWxid'))
+        if (configuredMyWxid) {
+            const normalizedMyWxid = this.normalizeTimelineUsername(configuredMyWxid)
+            if (normalizedMyWxid && expanded[configuredMyWxid] === undefined && expanded[normalizedMyWxid] !== undefined) {
+                expanded[configuredMyWxid] = expanded[normalizedMyWxid]
+            }
+        }
+
+        return expanded
+    }
+
+    private expandTimelineUsernameFilters(usernames?: string[]): string[] | undefined {
+        if (!Array.isArray(usernames) || usernames.length === 0) return usernames
+
+        const expanded: string[] = []
+        for (const username of usernames) {
+            const trimmed = String(username || '').trim()
+            if (!trimmed) continue
+            expanded.push(trimmed)
+
+            const normalized = this.normalizeTimelineUsername(trimmed)
+            if (normalized && normalized !== trimmed.toLowerCase()) {
+                expanded.push(normalized)
+            }
+        }
+
+        const deduped = dedupeTimelineUsernames(expanded)
+        return deduped.length > 0 ? deduped : undefined
+    }
+
     private async getExportStatsFromTimeline(myWxid?: string): Promise<{ totalPosts: number; totalFriends: number; myPosts: number | null }> {
         const pageSize = 500
         const uniqueUsers = new Set<string>()
@@ -890,7 +959,7 @@ class SnsService {
             offset += rows.length
         }
 
-        return counts
+            return this.expandTimelineCountsAlias(counts)
     }
 
     async getUserPostCounts(options?: {
@@ -1018,7 +1087,14 @@ class SnsService {
     }
 
     async getTimeline(limit: number = 20, offset: number = 0, usernames?: string[], keyword?: string, startTime?: number, endTime?: number): Promise<{ success: boolean; timeline?: SnsPost[]; error?: string }> {
-        const result = await wcdbService.getSnsTimeline(limit, offset, usernames, keyword, startTime, endTime)
+        const result = await wcdbService.getSnsTimeline(
+            limit,
+            offset,
+            this.expandTimelineUsernameFilters(usernames),
+            keyword,
+            startTime,
+            endTime
+        )
         if (!result.success || !result.timeline || result.timeline.length === 0) return result
 
         const enrichedTimeline = result.timeline.map((post: any) => {

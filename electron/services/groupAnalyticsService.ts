@@ -613,6 +613,33 @@ class GroupAnalyticsService {
     return undefined
   }
 
+  private async buildAvatarLookup(candidates: Array<string | undefined | null>): Promise<Map<string, string>> {
+    const lookup = new Map<string, string>()
+    const ids = this.buildIdCandidates(candidates)
+    if (ids.length === 0) return lookup
+
+    const result = await wcdbService.getAvatarUrls(ids)
+    if (!result.success || !result.map) return lookup
+
+    for (const [rawId, rawUrl] of Object.entries(result.map)) {
+      const url = String(rawUrl || '').trim()
+      if (!url) continue
+      for (const id of this.buildIdCandidates([rawId])) {
+        lookup.set(id.toLowerCase(), url)
+      }
+    }
+
+    return lookup
+  }
+
+  private resolveAvatarByCandidates(lookup: Map<string, string>, candidates: Array<string | undefined | null>): string | undefined {
+    for (const id of this.buildIdCandidates(candidates)) {
+      const hit = lookup.get(id.toLowerCase())
+      if (hit) return hit
+    }
+    return undefined
+  }
+
   private async buildGroupMessageCountLookup(chatroomId: string): Promise<Map<string, number>> {
     const lookup = new Map<string, number>()
     const result = await wcdbService.getGroupStats(chatroomId, 0, 0)
@@ -1001,6 +1028,15 @@ class GroupAnalyticsService {
       ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUserName),
       ...Array.from(contactLookup.values()).map((contact) => contact?.alias)
     ])
+    const avatarLookup = await this.buildAvatarLookup([
+      ...members.map((member) => member.username),
+      ...members.map((member) => member.originalName),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.username),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.userName),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUsername),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUserName),
+      ...Array.from(contactLookup.values()).map((contact) => contact?.alias)
+    ])
     const groupNicknames = await this.getGroupNicknamesForRoom(chatroomId, nicknameCandidates)
     const myWxid = this.cleanAccountDirName(this.configService.get('myWxid') || '')
     let myGroupMessageCountHint: number | undefined
@@ -1029,6 +1065,8 @@ class GroupAnalyticsService {
         }
         const groupNickname = this.resolveGroupNicknameByCandidates(groupNicknames, lookupCandidates)
         const displayName = displayNames.success && displayNames.map ? (displayNames.map[wxid] || wxid) : wxid
+        const avatarUrl = String(member.avatarUrl || '').trim() ||
+          this.resolveAvatarByCandidates(avatarLookup, lookupCandidates)
 
         return {
           username: wxid,
@@ -1037,7 +1075,7 @@ class GroupAnalyticsService {
           alias,
           remark,
           groupNickname,
-          avatarUrl: member.avatarUrl,
+          avatarUrl,
           isOwner: Boolean(ownerUsername && ownerUsername === wxid),
           isFriend: this.isFriendMember(wxid, contact),
           messageCount: this.resolveMessageCountByCandidates(messageCountLookup, lookupCandidates)
@@ -1175,6 +1213,15 @@ class GroupAnalyticsService {
         ...Array.from(contactMap.values()).map((c) => c?.encryptUserName),
         ...Array.from(contactMap.values()).map((c) => c?.alias)
       ])
+      const avatarLookup = await this.buildAvatarLookup([
+        ...members.map((m) => m.username),
+        ...members.map((m) => m.originalName),
+        ...Array.from(contactMap.values()).map((c) => c?.username),
+        ...Array.from(contactMap.values()).map((c) => c?.userName),
+        ...Array.from(contactMap.values()).map((c) => c?.encryptUsername),
+        ...Array.from(contactMap.values()).map((c) => c?.encryptUserName),
+        ...Array.from(contactMap.values()).map((c) => c?.alias)
+      ])
       const groupNicknames = await this.getGroupNicknamesForRoom(chatroomId, nicknameCandidates)
 
       const myWxid = this.cleanAccountDirName(this.configService.get('myWxid') || '')
@@ -1200,6 +1247,8 @@ class GroupAnalyticsService {
           lookupCandidates.push(myWxid)
         }
         const groupNickname = this.resolveGroupNicknameByCandidates(groupNicknames, lookupCandidates)
+        const avatarUrl = String(m.avatarUrl || '').trim() ||
+          this.resolveAvatarByCandidates(avatarLookup, lookupCandidates)
 
         return {
           username: wxid,
@@ -1208,7 +1257,7 @@ class GroupAnalyticsService {
           alias,
           remark,
           groupNickname,
-          avatarUrl: m.avatarUrl,
+          avatarUrl,
           isOwner: Boolean(ownerUsername && ownerUsername === wxid)
         }
       })
